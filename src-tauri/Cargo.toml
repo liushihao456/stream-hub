@@ -1,0 +1,21 @@
+[package]
+name = "stream-hub"
+version = "0.1.0"
+description = "Stream Hub desktop app"
+authors = ["liushihao"]
+edition = "2021"
+
+[lib]
+name = "stream_hub_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0.6", features = [] }
+
+[dependencies]
+md5 = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.8.5", features = [] }
+uuid = { version = "1", features = ["v4"] }
