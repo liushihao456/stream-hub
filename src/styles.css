@@ -35,7 +35,7 @@ button {
   cursor: pointer;
 }
 
-input {
+input:not([type="checkbox"]) {
   width: 100%;
   border: 1px solid #2a2f38;
   border-radius: 18px;
@@ -45,7 +45,7 @@ input {
   color: #f2efe9;
 }
 
-input:focus,
+input:not([type="checkbox"]):focus,
 button:focus {
   outline: 2px solid #9fb2ff;
   outline-offset: 2px;
@@ -543,6 +543,54 @@ button:focus {
   grid-template-columns: 1fr auto;
   gap: 0.9rem;
   align-items: end;
+}
+
+.player-picker {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.2rem;
+  padding: 0.2rem;
+  margin-bottom: 0.9rem;
+  border-radius: 18px;
+  background: #15181e;
+  border: 1px solid #2a303a;
+}
+
+.player-picker-button {
+  min-height: var(--control-height);
+  padding: 0 1rem;
+  border-radius: 16px;
+  background: transparent;
+  color: #95a0b2;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+.player-picker-button.active {
+  background: #2b313b;
+  color: #f5f7fa;
+}
+
+.player-extra {
+  margin-top: 0.9rem;
+}
+
+.toggle-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.7rem;
+  color: #d9dfeb;
+}
+
+.toggle-row input[type="checkbox"] {
+  width: 1rem;
+  height: 1rem;
+  accent-color: #d8deea;
+}
+
+.settings-hint {
+  margin: 0.9rem 0 0;
+  color: #9aa3b2;
+  line-height: 1.6;
 }
 
 .loading-view,

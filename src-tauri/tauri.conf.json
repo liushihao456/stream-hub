@@ -32,6 +32,8 @@
     "active": true,
     "targets": "all",
     "resources": [
+      "resources/iina-plugin-danmaku",
+      "resources/douyu_danmaku_bridge.js",
       "../douyu_extract_playurl.js",
       "../douyu_search_streamers.js",
       "../douyu_to_mpv.py"

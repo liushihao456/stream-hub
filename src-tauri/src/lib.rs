@@ -1,3 +1,10 @@
+use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, State};
+use axum::http::{HeaderValue as AxumHeaderValue, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::Router;
+use futures_util::StreamExt;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, ORIGIN, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -6,8 +13,13 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpListener;
+use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
 const DOUYU_USER_AGENT: &str =
@@ -25,10 +37,24 @@ struct Streamer {
     heat_text: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 struct Settings {
+    player: String,
+    iina_path: String,
     mpv_path: String,
+    enable_iina_danmaku: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            player: default_player().to_string(),
+            iina_path: String::new(),
+            mpv_path: String::new(),
+            enable_iina_danmaku: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,10 +124,128 @@ struct RoomSnapshot {
     heat_text: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DanmakuCommentPayload {
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DanmakuEventPayload {
+    method: String,
+    dms: Vec<DanmakuCommentPayload>,
+}
+
+struct DanmakuServerState {
+    started: AtomicBool,
+    port: u16,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DanmakuBridgeEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SearchApiUserResponse {
+    data: SearchApiUserData,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct SearchApiUserData {
+    #[serde(default, rename = "relateUser")]
+    relate_user: Vec<SearchApiUserItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SearchApiUserItem {
+    #[serde(rename = "anchorInfo")]
+    anchor_info: SearchApiAnchorInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SearchApiAnchorInfo {
+    #[serde(rename = "rid", deserialize_with = "deserialize_value_to_string")]
+    room_id: String,
+    #[serde(rename = "nickName")]
+    nick_name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    avatar: String,
+    #[serde(default, rename = "roomSrc")]
+    room_src: String,
+    #[serde(default, rename = "isLive")]
+    is_live: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IinaPlusArgs {
+    raw_url: String,
+    mpv_script: String,
+    port: u16,
+    urls: Vec<String>,
+    r#type: i32,
+    qualitys: Vec<String>,
+    lines: Vec<String>,
+    current_quality: usize,
+    current_line: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DanmakuWsQuery {
+    #[serde(default, rename = "roomId")]
+    room_id: String,
+}
+
+#[derive(Clone)]
+struct DanmakuHttpState {
+    dummy_media: Arc<Vec<u8>>,
+    node_bin: String,
+    bridge_script: PathBuf,
+}
+
+const DUMMY_WAV_BYTES: &[u8] = &[
+    0x52, 0x49, 0x46, 0x46, 0x24, 0x08, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74,
+    0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x40, 0x1f, 0x00, 0x00, 0x80, 0x3e,
+    0x00, 0x00, 0x02, 0x00, 0x10, 0x00, 0x64, 0x61, 0x74, 0x61, 0x00, 0x08, 0x00, 0x00,
+];
+
 fn douyu_client() -> Result<Client, String> {
     Client::builder()
+        .cookie_store(true)
         .build()
         .map_err(|err| err.to_string())
+}
+
+fn default_player() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "iina"
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        "mpv"
+    }
+}
+
+fn danmaku_text_event(text: impl Into<String>) -> Result<String, String> {
+    let event = DanmakuEventPayload {
+        method: "sendDM".to_string(),
+        dms: vec![DanmakuCommentPayload { text: text.into() }],
+    };
+    serde_json::to_string(&event).map_err(|err| err.to_string())
+}
+
+fn deserialize_value_to_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value_to_string(&value))
 }
 
 fn md5_hex(input: &str) -> String {
@@ -165,6 +309,52 @@ fn fetch_text(url: &str, referer: Option<&str>) -> Result<String, String> {
 fn fetch_json(url: &str, referer: Option<&str>) -> Result<Value, String> {
     let text = fetch_text(url, referer)?;
     serde_json::from_str(&text).map_err(|err| err.to_string())
+}
+
+fn fetch_search_json(url: &str, keyword: &str) -> Result<Value, String> {
+    let client = douyu_client()?;
+    let mut bootstrap_headers = HeaderMap::new();
+    bootstrap_headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(DOUYU_USER_AGENT).map_err(|err| err.to_string())?,
+    );
+    bootstrap_headers.insert(
+        REFERER,
+        HeaderValue::from_static("https://www.douyu.com/search/"),
+    );
+    bootstrap_headers.insert(ORIGIN, HeaderValue::from_static("https://www.douyu.com"));
+    bootstrap_headers.insert(
+        "accept",
+        HeaderValue::from_static("application/json, text/plain, */*"),
+    );
+    bootstrap_headers.insert(
+        "x-requested-with",
+        HeaderValue::from_static("XMLHttpRequest"),
+    );
+
+    let _ = client
+        .get("https://www.douyu.com/")
+        .headers(bootstrap_headers.clone())
+        .send();
+    let _ = client
+        .get(format!(
+            "https://www.douyu.com/search?kw={}",
+            urlencoding::encode(keyword)
+        ))
+        .headers(bootstrap_headers.clone())
+        .send();
+
+    let response = client
+        .get(url)
+        .headers(bootstrap_headers)
+        .send()
+        .map_err(|err| err.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP {} for {}", response.status(), url));
+    }
+
+    response.json().map_err(|err| err.to_string())
 }
 
 fn post_form_json(url: &str, referer: &str, body: &[(String, String)]) -> Result<Value, String> {
@@ -247,12 +437,20 @@ fn extract_room_info(html: &str) -> Result<RoomInfo, String> {
 
     Ok(RoomInfo {
         room_id,
-        is_living: value_to_string(&room["status"]) == "1"
-            || matches!(room["show_status"].as_i64(), Some(1 | 2)),
+        is_living: is_room_online(room),
         streamer_name: value_to_string(&room["nickname"]),
         room_name: value_to_string(&room["room_name"]),
         avatar_url: if avatar_big.is_empty() { avatar_mid } else { avatar_big },
     })
+}
+
+fn is_room_online(room: &Value) -> bool {
+    let status_live = value_to_string(&room["status"]) == "1";
+    match room["show_status"].as_i64() {
+        Some(1) => status_live,
+        Some(_) => false,
+        None => status_live,
+    }
 }
 
 fn get_room_meta(room_id: &str) -> Result<RoomMeta, String> {
@@ -283,39 +481,23 @@ fn get_room_snapshot(room_id: &str) -> Result<RoomSnapshot, String> {
         streamer_name: value_to_string(&room["nickname"]),
         room_name: value_to_string(&room["room_name"]),
         avatar_url: if avatar_big.is_empty() { avatar_mid } else { avatar_big },
-        is_online: value_to_string(&room["status"]) == "1"
-            || matches!(room["show_status"].as_i64(), Some(1 | 2)),
-        screenshot_url: value_to_string(&room["room_pic"]),
-        heat_text: value_to_string(&room["room_biz_all"]["hot"]),
+        is_online: is_room_online(room),
+        screenshot_url: if is_room_online(room) {
+            value_to_string(&room["room_pic"])
+        } else {
+            String::new()
+        },
+        heat_text: if is_room_online(room) {
+            value_to_string(&room["room_biz_all"]["hot"])
+        } else {
+            String::new()
+        },
     })
-}
-
-fn get_search_live_state(keyword: &str, room_id: &str) -> Result<Option<bool>, String> {
-    let url = format!(
-        "https://www.douyu.com/japi/search/api/searchUser?kw={keyword}&page=1&pageSize=10"
-    );
-    let json = fetch_json(&url, Some("https://www.douyu.com/search/"))?;
-    let users = json["data"]["relateUser"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-
-    for item in users {
-        let anchor = &item["anchorInfo"];
-        if value_to_string(&anchor["rid"]) == room_id {
-            return Ok(Some(anchor["isLive"].as_i64().unwrap_or_default() == 1));
-        }
-    }
-
-    Ok(None)
 }
 
 fn fetch_room_state(target: &str) -> Result<ExtractResult, String> {
     if let Some(room_id) = extract_room_id_from_target(target) {
-        let mut snapshot = get_room_snapshot(&room_id)?;
-        if let Ok(Some(is_live)) = get_search_live_state(&room_id, &room_id) {
-            snapshot.is_online = is_live;
-        }
+        let snapshot = get_room_snapshot(&room_id)?;
         return Ok(ExtractResult {
             room_id: snapshot.room_id,
             streamer_name: snapshot.streamer_name,
@@ -543,6 +725,15 @@ fn write_playlist(title: &str, urls: &[String]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn normalize_player(settings: &Settings) -> String {
+    let player = settings.player.trim().to_lowercase();
+    if player.is_empty() {
+        default_player().to_string()
+    } else {
+        player
+    }
+}
+
 fn detect_mpv(settings: &Settings) -> Result<String, String> {
     if !settings.mpv_path.trim().is_empty() {
         return Ok(settings.mpv_path.trim().to_string());
@@ -574,6 +765,527 @@ fn detect_mpv(settings: &Settings) -> Result<String, String> {
     Err("未找到可用的 mpv，请在设置里手动填写 mpv 路径。".into())
 }
 
+fn normalize_iina_cli_candidate(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.ends_with("/Contents/MacOS/iina-cli") {
+        trimmed.to_string()
+    } else if trimmed.ends_with(".app") {
+        format!("{trimmed}/Contents/MacOS/iina-cli")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn escape_mpv_script_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn build_mpv_script_opts(media_title: &str) -> String {
+    let options = [
+        ("force-media-title", media_title),
+        ("ytdl", "no"),
+        ("stream-lavf-o", "reconnect_streamed=yes"),
+    ];
+
+    options
+        .iter()
+        .map(|(key, value)| format!(r#"{key}="{}""#, escape_mpv_script_value(value)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn encode_hex(data: &[u8]) -> String {
+    data.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn build_iina_plus_args(data: &ExtractResult, media_title: &str, port: u16) -> Result<String, String> {
+    let payload = IinaPlusArgs {
+        raw_url: data.page_url.clone(),
+        mpv_script: build_mpv_script_opts(media_title),
+        port,
+        urls: data.urls.clone(),
+        r#type: 0,
+        qualitys: vec!["原画".to_string()],
+        lines: data
+            .urls
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("线路 {}", index + 1))
+            .collect(),
+        current_quality: 0,
+        current_line: 0,
+    };
+    let json = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
+    Ok(encode_hex(&json))
+}
+
+fn detect_iina_cli(settings: &Settings) -> Result<String, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = settings;
+        return Err("IINA 仅支持在 macOS 上使用。".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if !settings.iina_path.trim().is_empty() {
+            let normalized = normalize_iina_cli_candidate(&settings.iina_path);
+            if Path::new(&normalized).exists() {
+                return Ok(normalized);
+            }
+            return Err("未找到你填写的 IINA 路径。".to_string());
+        }
+
+        let candidates = [
+            "/Applications/IINA.app/Contents/MacOS/iina-cli",
+            "/Applications/IINA Nightly.app/Contents/MacOS/iina-cli",
+            "/Applications/IINA.app",
+            "/Applications/IINA Nightly.app",
+        ];
+
+        for candidate in candidates {
+            let normalized = normalize_iina_cli_candidate(candidate);
+            if Path::new(&normalized).exists() {
+                return Ok(normalized);
+            }
+        }
+
+        Err("未找到可用的 IINA，请在设置里手动填写 IINA.app 或 iina-cli 路径。".to_string())
+    }
+}
+
+fn iina_plugin_root() -> Result<PathBuf, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("IINA 插件仅支持在 macOS 上安装。".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = env::var("HOME").map_err(|err| err.to_string())?;
+        let path = PathBuf::from(home)
+            .join("Library/Application Support/com.colliderli.iina/plugins");
+        fs::create_dir_all(&path).map_err(|err| err.to_string())?;
+        Ok(path)
+    }
+}
+
+fn enable_iina_plugin_system() -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("defaults")
+            .arg("write")
+            .arg("com.colliderli.iina")
+            .arg("iinaEnablePluginSystem")
+            .arg("-bool")
+            .arg("true")
+            .status()
+            .map_err(|err| format!("启用 IINA 插件系统失败：{err}"))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err("启用 IINA 插件系统失败。".to_string())
+        }
+    }
+}
+
+fn xjbeta_iina_plugin_dir() -> Result<PathBuf, String> {
+    let plugin_dir = iina_plugin_root()?.join("com.xjbeta.danmaku.iinaplugin");
+    if plugin_dir.exists() {
+        Ok(plugin_dir)
+    } else {
+        Err("未检测到 IINA 弹幕插件 com.xjbeta.danmaku，请先安装 iina-plus 的弹幕插件。".to_string())
+    }
+}
+
+fn detect_node_binary() -> Result<String, String> {
+    let candidates = [
+        "node",
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+    ];
+
+    for candidate in candidates {
+        let mut cmd = Command::new(candidate);
+        cmd.arg("--version");
+        if let Ok(status) = cmd.status() {
+            if status.success() {
+                return Ok(candidate.to_string());
+            }
+        }
+    }
+
+    Err("未找到可用的 Node.js，斗鱼弹幕桥接无法启动。".to_string())
+}
+
+fn locate_danmaku_bridge_script(app: &AppHandle) -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("douyu_danmaku_bridge.js"));
+    }
+
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/douyu_danmaku_bridge.js"));
+
+    if let Ok(current_dir) = env::current_dir() {
+        candidates.push(current_dir.join("src-tauri/resources/douyu_danmaku_bridge.js"));
+        candidates.push(current_dir.join("resources/douyu_danmaku_bridge.js"));
+    }
+
+    candidates
+        .into_iter()
+        .find(|path| path.exists() && path.is_file())
+        .ok_or_else(|| "未找到斗鱼弹幕桥接脚本。".to_string())
+}
+
+fn enable_xjbeta_iina_plugin() -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = xjbeta_iina_plugin_dir()?;
+        let plugin_key = "PluginEnabled.com.xjbeta.danmaku";
+        let status = Command::new("defaults")
+            .arg("write")
+            .arg("com.colliderli.iina")
+            .arg(plugin_key)
+            .arg("-bool")
+            .arg("true")
+            .status()
+            .map_err(|err| format!("启用 IINA 弹幕插件失败：{err}"))?;
+
+        if !status.success() {
+            return Err("启用 IINA 弹幕插件失败。".to_string());
+        }
+
+        let preferences_dir = iina_plugin_root()?.join(".preferences");
+        fs::create_dir_all(&preferences_dir).map_err(|err| err.to_string())?;
+        let pref_plist = preferences_dir.join("com.xjbeta.danmaku.plist");
+        let parse_status = Command::new("defaults")
+            .arg("write")
+            .arg(pref_plist.as_os_str())
+            .arg("enableIINAPLUSOptsParse")
+            .arg("1")
+            .status()
+            .map_err(|err| format!("启用 IINA 弹幕参数解析失败：{err}"))?;
+
+        if parse_status.success() {
+            patch_xjbeta_plugin_visibility_behavior()?;
+            Ok(())
+        } else {
+            Err("启用 IINA 弹幕参数解析失败。".to_string())
+        }
+    }
+}
+
+fn patch_xjbeta_plugin_visibility_behavior() -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plugin_file = xjbeta_iina_plugin_dir()?.join("DanmakuWeb/main.js");
+        let content = fs::read_to_string(&plugin_file).map_err(|err| err.to_string())?;
+
+        let old_block = r#"    document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState == 'visible') {
+            console.log('visible');
+            cm.start();
+            cm.clear();
+        } else {
+            console.log('hidden');
+            cm.stop();
+            cm.clear();
+        };
+    });
+"#;
+
+        let new_block = r#"    document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState == 'visible') {
+            console.log('visible');
+            cm.start();
+        } else {
+            console.log('hidden');
+            cm.stop();
+        };
+    });
+"#;
+
+        if content.contains(new_block) {
+            return Ok(());
+        }
+
+        if !content.contains(old_block) {
+            return Err("未找到可修补的 IINA 弹幕可见性逻辑。".to_string());
+        }
+
+        let patched = content.replacen(old_block, new_block, 1);
+        fs::write(&plugin_file, patched).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+}
+
+fn is_iina_running() -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("pgrep")
+            .arg("-x")
+            .arg("IINA")
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+}
+
+fn restart_iina_if_needed() -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("osascript")
+            .arg("-e")
+            .arg("tell application \"IINA\" to quit")
+            .status()
+            .map_err(|err| format!("重启 IINA 失败：{err}"))?;
+
+        if !status.success() {
+            return Err("重启 IINA 失败。".to_string());
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        Ok(())
+    }
+}
+
+fn open_iina_playlist(
+    app: &AppHandle,
+    settings: &Settings,
+    playlist_path: &Path,
+    media_title: &str,
+    data: &ExtractResult,
+) -> Result<(), String> {
+    let iina_cli = detect_iina_cli(settings)?;
+    if settings.enable_iina_danmaku {
+        enable_iina_plugin_system()?;
+        enable_xjbeta_iina_plugin()?;
+    }
+
+    let mut command = Command::new(iina_cli);
+    command.arg("--no-stdin");
+
+    if settings.enable_iina_danmaku {
+        let danmaku_port = ensure_danmaku_server(app)?;
+        let args_hex = build_iina_plus_args(data, media_title, danmaku_port)?;
+        let checker = args_hex
+            .chars()
+            .rev()
+            .take(25)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        command.arg(format!("--mpv-script-opts=iinaPlusArgs={args_hex}"));
+        command.arg(format!(
+            "http://127.0.0.1:{danmaku_port}/video.mp4?{checker}"
+        ));
+    } else {
+        command.arg("--mpv-ytdl=no");
+        command.arg("--mpv-stream-lavf-o=reconnect_streamed=yes");
+        command.arg(format!("--mpv-force-media-title={media_title}"));
+        command.arg(playlist_path);
+    }
+
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    command.spawn().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn open_mpv_playlist(
+    playlist_path: &Path,
+    media_title: &str,
+    settings: &Settings,
+) -> Result<(), String> {
+    let mpv_bin = detect_mpv(settings)?;
+    let mut command = Command::new(mpv_bin);
+    command.arg("--ytdl=no");
+    command.arg("--stream-lavf-o=reconnect_streamed=yes");
+    command.arg(format!("--force-media-title={media_title}"));
+    command.arg(playlist_path);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    command.spawn().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn ensure_danmaku_server(app: &AppHandle) -> Result<u16, String> {
+    let state = app.state::<Arc<DanmakuServerState>>();
+    if state.started.swap(true, Ordering::SeqCst) {
+        return Ok(state.port);
+    }
+
+    let port = state.port;
+    let http_state = DanmakuHttpState {
+        dummy_media: Arc::new(DUMMY_WAV_BYTES.to_vec()),
+        node_bin: detect_node_binary()?,
+        bridge_script: locate_danmaku_bridge_script(app)?,
+    };
+    let state_ref = Arc::clone(&state.inner().clone());
+    tauri::async_runtime::spawn(async move {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => run_danmaku_server(listener, http_state).await,
+            Err(_) => {
+                state_ref.started.store(false, Ordering::SeqCst);
+            }
+        }
+    });
+    Ok(port)
+}
+
+async fn run_danmaku_server(listener: TcpListener, state: DanmakuHttpState) {
+    let app = Router::new()
+        .route("/video.mp4", get(handle_dummy_video))
+        .route("/danmaku-websocket", get(handle_danmaku_websocket))
+        .with_state(state);
+    let _ = axum::serve(listener, app).await;
+}
+
+async fn handle_dummy_video(
+    State(state): State<DanmakuHttpState>,
+) -> impl IntoResponse {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("content-type", AxumHeaderValue::from_static("audio/wav"));
+    headers.insert("cache-control", AxumHeaderValue::from_static("no-store"));
+    (StatusCode::OK, headers, (*state.dummy_media).clone())
+}
+
+async fn handle_danmaku_websocket(
+    State(state): State<DanmakuHttpState>,
+    ws: WebSocketUpgrade,
+    Query(query): Query<DanmakuWsQuery>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        let _ = proxy_douyu_danmaku(socket, query.room_id, state).await;
+    })
+}
+
+fn parse_room_id_from_client_message(message: &str) -> Option<String> {
+    let payload = if let Some(raw) = message.strip_prefix("iinaDM://") {
+        if let Some((prefix, url)) = raw.split_once('&') {
+            if prefix.starts_with("v=") {
+                url
+            } else {
+                raw
+            }
+        } else {
+            raw
+        }
+    } else {
+        message
+    };
+
+    extract_room_id_from_target(payload)
+}
+
+async fn proxy_douyu_danmaku(
+    mut client_stream: WebSocket,
+    initial_room_id: String,
+    state: DanmakuHttpState,
+) -> Result<(), String> {
+    client_stream
+        .send(AxumMessage::Text(
+            danmaku_text_event("Stream Hub 本地弹幕服务已连接")?,
+        ))
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let room_id = if !initial_room_id.trim().is_empty() {
+        initial_room_id
+    } else {
+        let mut parsed_room_id = String::new();
+        while let Some(Ok(message)) = client_stream.next().await {
+            match message {
+                AxumMessage::Text(text) => {
+                    if let Some(room_id) = parse_room_id_from_client_message(&text) {
+                        parsed_room_id = room_id;
+                        break;
+                    }
+                }
+                AxumMessage::Close(_) => return Ok(()),
+                _ => {}
+            }
+        }
+        parsed_room_id
+    };
+
+    if room_id.is_empty() {
+        let _ = client_stream
+            .send(AxumMessage::Text(
+                danmaku_text_event("Stream Hub 未能解析房间号")?,
+            ))
+            .await;
+        return Err("无法确定弹幕房间号".to_string());
+    }
+
+    let mut child = TokioCommand::new(&state.node_bin)
+        .arg(&state.bridge_script)
+        .arg(&room_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| err.to_string())?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "斗鱼弹幕桥接未输出 stdout。".to_string())?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    while let Some(line) = lines.next_line().await.map_err(|err| err.to_string())? {
+        let event: DanmakuBridgeEvent = match serde_json::from_str(&line) {
+            Ok(event) => event,
+            Err(_) => continue,
+        };
+
+        let outgoing = match event.event_type.as_str() {
+            "status" => danmaku_text_event(event.text)?,
+            "chat" => danmaku_text_event(event.text)?,
+            "error" => danmaku_text_event(format!("Stream Hub 弹幕桥接失败: {}", event.text))?,
+            _ => continue,
+        };
+
+        if client_stream.send(AxumMessage::Text(outgoing)).await.is_err() {
+            let _ = child.kill().await;
+            break;
+        }
+    }
+
+    let _ = child.kill().await;
+    Ok(())
+}
+
 fn search_streamers_inner(keyword: &str) -> Result<Vec<SearchStreamer>, String> {
     let query = keyword.trim();
     if query.is_empty() {
@@ -582,32 +1294,29 @@ fn search_streamers_inner(keyword: &str) -> Result<Vec<SearchStreamer>, String> 
 
     let url = format!(
         "https://www.douyu.com/japi/search/api/searchUser?kw={}&page=1&pageSize=30",
-        query
+        urlencoding::encode(query)
     );
-    let json = fetch_json(&url, Some("https://www.douyu.com/search/"))?;
-    let users = json["data"]["relateUser"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let response: SearchApiUserResponse = serde_json::from_value(fetch_search_json(&url, query)?)
+        .map_err(|err| err.to_string())?;
 
     let mut results = Vec::new();
-    for item in users {
-        let anchor = &item["anchorInfo"];
-        let room_id = value_to_string(&anchor["rid"]);
-        let name = value_to_string(&anchor["nickName"]);
+    for item in response.data.relate_user {
+        let anchor = item.anchor_info;
+        let room_id = anchor.room_id;
+        let name = anchor.nick_name;
         if room_id.is_empty() || name.is_empty() {
             continue;
         }
 
-        let is_online = anchor["isLive"].as_i64().unwrap_or_default() == 1;
+        let is_online = anchor.is_live == 1;
         let mut result = SearchStreamer {
             name,
             target: room_id.clone(),
             room_id,
-            room_name: value_to_string(&anchor["description"]),
-            avatar_url: value_to_string(&anchor["avatar"]),
+            room_name: anchor.description,
+            avatar_url: anchor.avatar,
             is_online,
-            screenshot_url: value_to_string(&anchor["roomSrc"]),
+            screenshot_url: anchor.room_src,
             heat_text: String::new(),
         };
 
@@ -676,6 +1385,19 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, String>
     let path = app_data_file(&app, "settings.json")?;
     write_json(&path, &settings)?;
     Ok(settings)
+}
+
+#[tauri::command]
+fn install_iina_danmaku_plugin(app: AppHandle) -> Result<String, String> {
+    let _ = app;
+    enable_iina_plugin_system()?;
+    enable_xjbeta_iina_plugin()?;
+    if is_iina_running() {
+        restart_iina_if_needed()?;
+        Ok("已启用 IINA 弹幕插件并重启 IINA。".to_string())
+    } else {
+        Ok("已启用 IINA 弹幕插件。".to_string())
+    }
 }
 
 #[tauri::command]
@@ -750,7 +1472,7 @@ fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Result<Vec
 }
 
 #[tauri::command]
-fn play_streamer(streamer: Streamer, settings: Settings) -> Result<(), String> {
+fn play_streamer(app: AppHandle, streamer: Streamer, settings: Settings) -> Result<(), String> {
     let data = extract_play_info(&streamer.target)?;
     if !data.is_online {
         return Err("主播当前未开播".into());
@@ -760,32 +1482,30 @@ fn play_streamer(streamer: Streamer, settings: Settings) -> Result<(), String> {
     }
 
     let playlist_path = write_playlist(&data.title, &data.urls)?;
-    let mpv_bin = detect_mpv(&settings)?;
     let media_title = if data.title.trim().is_empty() {
         "Douyu Live".to_string()
     } else {
-        data.title
+        data.title.clone()
     };
 
-    let mut command = Command::new(mpv_bin);
-    command.arg("--ytdl=no");
-    command.arg("--stream-lavf-o=reconnect_streamed=yes");
-    command.arg(format!("--force-media-title={media_title}"));
-    command.arg(playlist_path);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
-    command.stderr(Stdio::null());
-    command.spawn().map_err(|err| err.to_string())?;
-    Ok(())
+    match normalize_player(&settings).as_str() {
+        "iina" => open_iina_playlist(&app, &settings, &playlist_path, &media_title, &data),
+        _ => open_mpv_playlist(&playlist_path, &media_title, &settings),
+    }
 }
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(Arc::new(DanmakuServerState {
+            started: AtomicBool::new(false),
+            port: 19080,
+        }))
         .invoke_handler(tauri::generate_handler![
             load_streamers,
             save_streamers,
             load_settings,
             save_settings,
+            install_iina_danmaku_plugin,
             resolve_streamer,
             search_streamers,
             sync_streamers_status,

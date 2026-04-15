@@ -171,7 +171,12 @@ function StreamerGroup({
 
 function App() {
   const [streamers, setStreamers] = useState([]);
-  const [settings, setSettings] = useState({ mpvPath: "" });
+  const [settings, setSettings] = useState({
+    player: "iina",
+    iinaPath: "",
+    mpvPath: "",
+    enableIinaDanmaku: true,
+  });
   const [activeTab, setActiveTab] = useState("favorites");
   const [searchInput, setSearchInput] = useState("");
   const [searchResults, setSearchResults] = useState([]);
@@ -334,6 +339,7 @@ function App() {
 
   async function handlePlay(streamer) {
     setError("");
+    setMessage("");
     try {
       await invoke("play_streamer", {
         streamer: {
@@ -349,6 +355,20 @@ function App() {
       });
     } catch (err) {
       setError(String(err));
+    }
+  }
+
+  async function handleInstallIinaPlugin() {
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      const result = await invoke("install_iina_danmaku_plugin");
+      setMessage(result);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -512,18 +532,68 @@ function App() {
             <div className="sub-panel-head">
               <h3>播放器设置</h3>
             </div>
+            <div className="player-picker" role="tablist" aria-label="播放器类型">
+              <button
+                type="button"
+                className={`player-picker-button ${settings.player === "iina" ? "active" : ""}`}
+                onClick={() => setSettings(current => ({ ...current, player: "iina" }))}
+              >
+                IINA
+              </button>
+              <button
+                type="button"
+                className={`player-picker-button ${settings.player === "mpv" ? "active" : ""}`}
+                onClick={() => setSettings(current => ({ ...current, player: "mpv" }))}
+              >
+                mpv
+              </button>
+            </div>
             <div className="player-settings">
               <label className="search-field">
                 <input
-                  value={settings.mpvPath}
-                  onChange={event => setSettings(current => ({ ...current, mpvPath: event.target.value }))}
-                  placeholder="mpv 路径 留空则使用系统 PATH 中的 mpv"
+                  value={settings.player === "iina" ? settings.iinaPath : settings.mpvPath}
+                  onChange={event =>
+                    setSettings(current => (
+                      settings.player === "iina"
+                        ? { ...current, iinaPath: event.target.value }
+                        : { ...current, mpvPath: event.target.value }
+                    ))
+                  }
+                  placeholder={
+                    settings.player === "iina"
+                      ? "IINA.app 或 iina-cli 路径 留空则自动查找"
+                      : "mpv 路径 留空则使用系统 PATH 中的 mpv"
+                  }
                 />
               </label>
               <button type="button" className="ghost-button" disabled={saving} onClick={() => persistSettings(settings)}>
                 保存
               </button>
             </div>
+            {settings.player === "iina" ? (
+              <div className="player-extra">
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settings.enableIinaDanmaku}
+                    onChange={event =>
+                      setSettings(current => ({ ...current, enableIinaDanmaku: event.target.checked }))
+                    }
+                  />
+                  <span>启用 IINA 弹幕</span>
+                </label>
+                <div className="overlay-actions">
+                  <button type="button" className="ghost-button" disabled={saving} onClick={handleInstallIinaPlugin}>
+                    安装或更新 IINA 弹幕插件
+                  </button>
+                </div>
+                <p className="settings-hint">
+                  选择 IINA 时，播放前会自动安装并更新内置弹幕插件。mpv 模式只播放直播，不显示弹幕。
+                </p>
+              </div>
+            ) : (
+              <p className="settings-hint">mpv 模式当前不启用弹幕。</p>
+            )}
           </div>
         </section>
       )}
