@@ -22,6 +22,11 @@ use tokio::net::TcpListener;
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+#[cfg(target_os = "macos")]
+use objc2_foundation::NSString;
+
 const DOUYU_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 
@@ -207,11 +212,7 @@ struct DanmakuHttpState {
     bridge_script: PathBuf,
 }
 
-const DUMMY_WAV_BYTES: &[u8] = &[
-    0x52, 0x49, 0x46, 0x46, 0x24, 0x08, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74,
-    0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x40, 0x1f, 0x00, 0x00, 0x80, 0x3e,
-    0x00, 0x00, 0x02, 0x00, 0x10, 0x00, 0x64, 0x61, 0x74, 0x61, 0x00, 0x08, 0x00, 0x00,
-];
+const EMPTY_M4A_BYTES: &[u8] = include_bytes!("../resources/empty.m4a");
 
 fn douyu_client() -> Result<Client, String> {
     Client::builder()
@@ -854,6 +855,41 @@ fn detect_iina_cli(settings: &Settings) -> Result<String, String> {
     }
 }
 
+fn iina_process_name_from_cli(iina_cli: &str) -> String {
+    if iina_cli.contains("Nightly") {
+        "IINA Nightly".to_string()
+    } else {
+        "IINA".to_string()
+    }
+}
+
+fn bring_iina_to_front(process_name: &str) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = process_name;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let bundle_id = if process_name.contains("Nightly") {
+            "com.colliderli.iina-nightly"
+        } else {
+            "com.colliderli.iina"
+        }
+        .to_string();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(350));
+            let apps = NSRunningApplication::runningApplicationsWithBundleIdentifier(
+                NSString::from_str(&bundle_id).as_ref(),
+            );
+            if let Some(app) = apps.firstObject() {
+                let _ = app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+            }
+        });
+    }
+}
+
 fn iina_plugin_root() -> Result<PathBuf, String> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -1084,6 +1120,7 @@ fn open_iina_playlist(
     data: &ExtractResult,
 ) -> Result<(), String> {
     let iina_cli = detect_iina_cli(settings)?;
+    let iina_process_name = iina_process_name_from_cli(&iina_cli);
     if settings.enable_iina_danmaku {
         enable_iina_plugin_system()?;
         enable_xjbeta_iina_plugin()?;
@@ -1091,6 +1128,8 @@ fn open_iina_playlist(
 
     let mut command = Command::new(iina_cli);
     command.arg("--no-stdin");
+    command.arg("--mpv-pause=no");
+    command.arg("--mpv-force-window=immediate");
 
     if settings.enable_iina_danmaku {
         let danmaku_port = ensure_danmaku_server(app)?;
@@ -1118,6 +1157,7 @@ fn open_iina_playlist(
     command.stdout(Stdio::null());
     command.stderr(Stdio::null());
     command.spawn().map_err(|err| err.to_string())?;
+    bring_iina_to_front(&iina_process_name);
     Ok(())
 }
 
@@ -1147,7 +1187,7 @@ fn ensure_danmaku_server(app: &AppHandle) -> Result<u16, String> {
 
     let port = state.port;
     let http_state = DanmakuHttpState {
-        dummy_media: Arc::new(DUMMY_WAV_BYTES.to_vec()),
+        dummy_media: Arc::new(EMPTY_M4A_BYTES.to_vec()),
         node_bin: detect_node_binary()?,
         bridge_script: locate_danmaku_bridge_script(app)?,
     };
@@ -1175,7 +1215,7 @@ async fn handle_dummy_video(
     State(state): State<DanmakuHttpState>,
 ) -> impl IntoResponse {
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert("content-type", AxumHeaderValue::from_static("audio/wav"));
+    headers.insert("content-type", AxumHeaderValue::from_static("audio/mp4"));
     headers.insert("cache-control", AxumHeaderValue::from_static("no-store"));
     (StatusCode::OK, headers, (*state.dummy_media).clone())
 }
