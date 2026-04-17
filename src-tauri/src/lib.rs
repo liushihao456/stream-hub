@@ -1472,43 +1472,47 @@ fn search_streamers(keyword: String) -> Result<Vec<SearchStreamer>, String> {
 }
 
 #[tauri::command]
-fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Result<Vec<Streamer>, String> {
-    let updated: Vec<Streamer> = streamers
-        .into_iter()
-        .map(|mut streamer| {
-            match fetch_room_state(&streamer.target) {
-                Ok(parsed) => {
-                    streamer.is_online = Some(parsed.is_online);
-                    if !parsed.avatar_url.trim().is_empty() {
-                        streamer.avatar_url = Some(parsed.avatar_url);
+async fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Result<Vec<Streamer>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let updated: Vec<Streamer> = streamers
+            .into_iter()
+            .map(|mut streamer| {
+                match fetch_room_state(&streamer.target) {
+                    Ok(parsed) => {
+                        streamer.is_online = Some(parsed.is_online);
+                        if !parsed.avatar_url.trim().is_empty() {
+                            streamer.avatar_url = Some(parsed.avatar_url);
+                        }
+                        if parsed.is_online && !parsed.screenshot_url.trim().is_empty() {
+                            streamer.screenshot_url = Some(parsed.screenshot_url);
+                        } else if !parsed.is_online {
+                            streamer.screenshot_url = None;
+                        }
+                        streamer.heat_text = if !parsed.is_online || parsed.heat_text.trim().is_empty() {
+                            None
+                        } else {
+                            Some(parsed.heat_text)
+                        };
+                        if !parsed.streamer_name.trim().is_empty() {
+                            streamer.name = parsed.streamer_name;
+                        }
                     }
-                    if parsed.is_online && !parsed.screenshot_url.trim().is_empty() {
-                        streamer.screenshot_url = Some(parsed.screenshot_url);
-                    } else if !parsed.is_online {
+                    Err(_) => {
+                        streamer.is_online = Some(false);
                         streamer.screenshot_url = None;
-                    }
-                    streamer.heat_text = if !parsed.is_online || parsed.heat_text.trim().is_empty() {
-                        None
-                    } else {
-                        Some(parsed.heat_text)
-                    };
-                    if !parsed.streamer_name.trim().is_empty() {
-                        streamer.name = parsed.streamer_name;
+                        streamer.heat_text = None;
                     }
                 }
-                Err(_) => {
-                    streamer.is_online = Some(false);
-                    streamer.screenshot_url = None;
-                    streamer.heat_text = None;
-                }
-            }
-            streamer
-        })
-        .collect();
+                streamer
+            })
+            .collect();
 
-    let path = app_data_file(&app, "streamers.json")?;
-    write_json(&path, &updated)?;
-    Ok(updated)
+        let path = app_data_file(&app, "streamers.json")?;
+        write_json(&path, &updated)?;
+        Ok(updated)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]

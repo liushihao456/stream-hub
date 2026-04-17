@@ -185,6 +185,7 @@ function App() {
   const [openMenuId, setOpenMenuId] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
@@ -290,11 +291,11 @@ function App() {
   }
 
   async function handleRefresh() {
-    if (streamers.length === 0) {
+    if (streamers.length === 0 || refreshing) {
       return;
     }
 
-    setSaving(true);
+    setRefreshing(true);
     setError("");
     try {
       const syncedStreamers = await invoke("sync_streamers_status", { streamers });
@@ -302,7 +303,7 @@ function App() {
     } catch (err) {
       setError(String(err));
     } finally {
-      setSaving(false);
+      setRefreshing(false);
     }
   }
 
@@ -414,9 +415,9 @@ function App() {
           type="button"
           className="refresh-button"
           onClick={handleRefresh}
-          disabled={saving || streamers.length === 0}
-          aria-label="刷新"
-          title="刷新"
+          disabled={refreshing || streamers.length === 0}
+          aria-label={refreshing ? "刷新中" : "刷新"}
+          title={refreshing ? "刷新中" : "刷新"}
         >
           <RefreshIcon />
         </button>
