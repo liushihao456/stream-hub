@@ -40,7 +40,9 @@
     ],
     "resources": [
       "resources/iina-plugin-danmaku",
+      "resources/bilibili_icon.ico",
       "resources/douyu_danmaku_bridge.js",
+      "resources/douyu_icon.ico",
       "../douyu_extract_playurl.js",
       "../douyu_search_streamers.js",
       "../douyu_to_mpv.py"

@@ -4,37 +4,55 @@ use axum::http::{HeaderValue as AxumHeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
+use base64::Engine;
+use block2::RcBlock;
 use futures_util::StreamExt;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, ORIGIN, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::ptr::NonNull;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command as TokioCommand;
+use url::Url;
 use uuid::Uuid;
 
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 #[cfg(target_os = "macos")]
-use objc2_foundation::NSString;
+use objc2_foundation::{NSArray, NSHTTPCookie, NSString};
+#[cfg(target_os = "macos")]
+use objc2_web_kit::WKWebView;
 
 const DOUYU_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+const BILIBILI_USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
+const PLATFORM_DOUYU: &str = "douyu";
+const PLATFORM_BILIBILI_LIVE: &str = "bilibili_live";
+
+fn default_streamer_platform() -> String {
+    PLATFORM_DOUYU.to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Streamer {
     id: String,
     name: String,
+    #[serde(default = "default_streamer_platform")]
+    platform: String,
     target: String,
     avatar_url: Option<String>,
     is_online: Option<bool>,
@@ -48,6 +66,7 @@ struct Settings {
     player: String,
     iina_path: String,
     mpv_path: String,
+    bilibili_cookie: String,
     enable_iina_danmaku: bool,
 }
 
@@ -57,6 +76,7 @@ impl Default for Settings {
             player: default_player().to_string(),
             iina_path: String::new(),
             mpv_path: String::new(),
+            bilibili_cookie: String::new(),
             enable_iina_danmaku: true,
         }
     }
@@ -66,6 +86,7 @@ impl Default for Settings {
 #[serde(rename_all = "camelCase")]
 struct ResolvedStreamer {
     name: String,
+    platform: String,
     target: String,
     room_id: String,
     room_name: String,
@@ -80,6 +101,7 @@ struct ResolvedStreamer {
 #[serde(rename_all = "camelCase")]
 struct SearchStreamer {
     name: String,
+    platform: String,
     target: String,
     room_id: String,
     room_name: String,
@@ -91,6 +113,7 @@ struct SearchStreamer {
 
 #[derive(Debug, Clone, Default)]
 struct ExtractResult {
+    platform: String,
     room_id: String,
     streamer_name: String,
     room_name: String,
@@ -185,6 +208,176 @@ struct SearchApiAnchorInfo {
     is_live: i64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliLiveSearchResponse {
+    data: BilibiliLiveSearchData,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BilibiliLiveSearchData {
+    #[serde(default)]
+    result: Vec<BilibiliLiveSearchItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliLiveSearchItem {
+    #[serde(default, deserialize_with = "deserialize_value_to_string")]
+    roomid: String,
+    #[serde(default)]
+    uname: String,
+    #[serde(default)]
+    live_status: i64,
+    #[serde(default)]
+    uface: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliRoomInfoResponse {
+    data: BilibiliRoomInfoData,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliRoomInfoData {
+    #[serde(deserialize_with = "deserialize_value_to_string")]
+    room_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    user_cover: String,
+    #[serde(default)]
+    keyframe: String,
+    #[serde(default, deserialize_with = "deserialize_value_to_string")]
+    online: String,
+    live_status: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliAnchorInfoResponse {
+    data: BilibiliAnchorInfoData,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliAnchorInfoData {
+    info: BilibiliAnchorInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliAnchorInfo {
+    #[serde(default)]
+    uname: String,
+    #[serde(default)]
+    face: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliRoomPlayInfoResponse {
+    data: BilibiliRoomPlayInfoData,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliRoomPlayInfoData {
+    encrypted: bool,
+    #[serde(default)]
+    pwd_verified: bool,
+    playurl_info: BilibiliPlayurlInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliPlayurlInfo {
+    playurl: BilibiliPlayurl,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliPlayurl {
+    #[serde(default)]
+    stream: Vec<BilibiliPlayStream>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliPlayStream {
+    #[serde(default, rename = "protocol_name")]
+    protocol_name: String,
+    #[serde(default, rename = "format")]
+    formats: Vec<BilibiliPlayFormat>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliPlayFormat {
+    #[serde(default, rename = "format_name")]
+    format_name: String,
+    #[serde(default, rename = "codec")]
+    codecs: Vec<BilibiliPlayCodec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliPlayCodec {
+    #[serde(default, rename = "codec_name")]
+    codec_name: String,
+    #[serde(default, rename = "current_qn")]
+    current_qn: i64,
+    #[serde(default, rename = "accept_qn")]
+    accept_qn: Vec<i64>,
+    #[serde(default, rename = "base_url")]
+    base_url: String,
+    #[serde(default, rename = "url_info")]
+    url_info: Vec<BilibiliUrlInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliUrlInfo {
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    extra: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliOldPlayUrlResponse {
+    data: BilibiliOldPlayUrlData,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliOldPlayUrlData {
+    #[serde(default)]
+    durl: Vec<BilibiliOldDurl>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliOldDurl {
+    #[serde(default)]
+    url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliRoomBaseInfoResponse {
+    data: BilibiliRoomBaseInfoData,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliRoomBaseInfoData {
+    #[serde(default, rename = "by_room_ids")]
+    by_room_ids: HashMap<String, BilibiliRoomBaseInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliRoomBaseInfo {
+    #[serde(deserialize_with = "deserialize_value_to_string")]
+    room_id: String,
+    #[serde(default, deserialize_with = "deserialize_value_to_string")]
+    short_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    uname: String,
+    #[serde(default)]
+    cover: String,
+    #[serde(default)]
+    live_url: String,
+    #[serde(default, deserialize_with = "deserialize_value_to_string")]
+    online: String,
+    live_status: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IinaPlusArgs {
@@ -203,6 +396,8 @@ struct IinaPlusArgs {
 struct DanmakuWsQuery {
     #[serde(default, rename = "roomId")]
     room_id: String,
+    #[serde(default)]
+    platform: String,
 }
 
 #[derive(Clone)]
@@ -212,9 +407,23 @@ struct DanmakuHttpState {
     bridge_script: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlatformIcons {
+    bilibili: String,
+    douyu: String,
+}
+
 const EMPTY_M4A_BYTES: &[u8] = include_bytes!("../resources/empty.m4a");
 
 fn douyu_client() -> Result<Client, String> {
+    Client::builder()
+        .cookie_store(true)
+        .build()
+        .map_err(|err| err.to_string())
+}
+
+fn bilibili_client() -> Result<Client, String> {
     Client::builder()
         .cookie_store(true)
         .build()
@@ -232,6 +441,71 @@ fn default_player() -> &'static str {
         "mpv"
     }
 }
+
+fn normalize_platform(platform: &str) -> &'static str {
+    match platform.trim().to_lowercase().as_str() {
+        PLATFORM_BILIBILI_LIVE => PLATFORM_BILIBILI_LIVE,
+        _ => PLATFORM_DOUYU,
+    }
+}
+
+fn infer_platform_from_target(target: &str) -> &'static str {
+    let trimmed = target.trim().to_lowercase();
+    if trimmed.contains("live.bilibili.com") {
+        PLATFORM_BILIBILI_LIVE
+    } else {
+        PLATFORM_DOUYU
+    }
+}
+
+fn ensure_streamer_platform(streamer: &mut Streamer) {
+    streamer.platform = normalize_platform(if streamer.platform.trim().is_empty() {
+        infer_platform_from_target(&streamer.target)
+    } else {
+        &streamer.platform
+    })
+    .to_string();
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => output.push(ch),
+            _ => {}
+        }
+    }
+    output
+}
+
+fn build_bilibili_live_url(room_id: &str) -> String {
+    format!("https://live.bilibili.com/{}", room_id.trim())
+}
+
+fn extract_bilibili_room_id(target: &str) -> Option<String> {
+    let trimmed = target.trim();
+    if !trimmed.is_empty() && trimmed.chars().all(|char| char.is_ascii_digit()) {
+        return Some(trimmed.to_string());
+    }
+
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let segment = without_query
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+
+    if !segment.is_empty() && segment.chars().all(|char| char.is_ascii_digit()) {
+        Some(segment.to_string())
+    } else {
+        None
+    }
+}
+
 
 fn danmaku_text_event(text: impl Into<String>) -> Result<String, String> {
     let event = DanmakuEventPayload {
@@ -356,6 +630,91 @@ fn fetch_search_json(url: &str, keyword: &str) -> Result<Value, String> {
     }
 
     response.json().map_err(|err| err.to_string())
+}
+
+fn fetch_bilibili_json(url: &str, referer: &str, raw_cookie: &str) -> Result<Value, String> {
+    let client = bilibili_client()?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(BILIBILI_USER_AGENT).map_err(|err| err.to_string())?,
+    );
+    headers.insert(REFERER, HeaderValue::from_str(referer).map_err(|err| err.to_string())?);
+    headers.insert(ORIGIN, HeaderValue::from_static("https://live.bilibili.com"));
+    if let Some(cookie_header) = build_bilibili_cookie_header(raw_cookie)? {
+        headers.insert(reqwest::header::COOKIE, cookie_header);
+    }
+
+    let _ = client
+        .get("https://www.bilibili.com")
+        .headers(headers.clone())
+        .send();
+
+    let response = client
+        .get(url)
+        .headers(headers)
+        .send()
+        .map_err(|err| err.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP {} for {}", response.status(), url));
+    }
+
+    response.json().map_err(|err| err.to_string())
+}
+
+fn build_bilibili_cookie_header(raw_cookie: &str) -> Result<Option<HeaderValue>, String> {
+    let mut cookies = raw_cookie
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if !cookies
+        .iter()
+        .any(|part| part.split('=').next().unwrap_or_default().trim() == "CURRENT_QUALITY")
+    {
+        cookies.push("CURRENT_QUALITY=125".to_string());
+    }
+
+    if cookies.is_empty() {
+        return Ok(None);
+    }
+
+    let header = cookies.join("; ");
+    let value = HeaderValue::from_str(&header).map_err(|err| err.to_string())?;
+    Ok(Some(value))
+}
+
+fn fetch_bilibili_search(keyword: &str) -> Result<Vec<BilibiliLiveSearchItem>, String> {
+    let client = bilibili_client()?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(BILIBILI_USER_AGENT).map_err(|err| err.to_string())?,
+    );
+    headers.insert(REFERER, HeaderValue::from_static("https://www.bilibili.com/"));
+    let _ = client
+        .get("https://www.bilibili.com")
+        .headers(headers.clone())
+        .send();
+
+    let response: BilibiliLiveSearchResponse = client
+        .get("https://api.bilibili.com/x/web-interface/search/type")
+        .headers(headers)
+        .query(&[
+            ("search_type", "live_user"),
+            ("keyword", keyword),
+            ("order", "online"),
+            ("page", "1"),
+        ])
+        .send()
+        .map_err(|err| err.to_string())?
+        .json()
+        .map_err(|err| err.to_string())?;
+
+    Ok(response.data.result)
 }
 
 fn post_form_json(url: &str, referer: &str, body: &[(String, String)]) -> Result<Value, String> {
@@ -496,10 +855,11 @@ fn get_room_snapshot(room_id: &str) -> Result<RoomSnapshot, String> {
     })
 }
 
-fn fetch_room_state(target: &str) -> Result<ExtractResult, String> {
+fn fetch_douyu_room_state(target: &str) -> Result<ExtractResult, String> {
     if let Some(room_id) = extract_room_id_from_target(target) {
         let snapshot = get_room_snapshot(&room_id)?;
         return Ok(ExtractResult {
+            platform: PLATFORM_DOUYU.to_string(),
             room_id: snapshot.room_id,
             streamer_name: snapshot.streamer_name,
             room_name: snapshot.room_name,
@@ -527,6 +887,7 @@ fn fetch_room_state(target: &str) -> Result<ExtractResult, String> {
 
     if !room_info.is_living {
         return Ok(ExtractResult {
+            platform: PLATFORM_DOUYU.to_string(),
             room_id: room_info.room_id,
             streamer_name: room_info.streamer_name,
             room_name: room_info.room_name,
@@ -543,6 +904,7 @@ fn fetch_room_state(target: &str) -> Result<ExtractResult, String> {
     let room_meta = get_room_meta(&room_info.room_id).unwrap_or_default();
 
     Ok(ExtractResult {
+        platform: PLATFORM_DOUYU.to_string(),
         room_id: room_info.room_id,
         streamer_name: room_info.streamer_name.clone(),
         room_name: room_info.room_name.clone(),
@@ -649,8 +1011,8 @@ fn get_backup_urls(play_data: &Value) -> Vec<String> {
         .collect()
 }
 
-fn extract_play_info(target: &str) -> Result<ExtractResult, String> {
-    let mut state = fetch_room_state(target)?;
+fn extract_douyu_play_info(target: &str) -> Result<ExtractResult, String> {
+    let mut state = fetch_douyu_room_state(target)?;
     if !state.is_online {
         return Ok(state);
     }
@@ -703,9 +1065,415 @@ fn extract_play_info(target: &str) -> Result<ExtractResult, String> {
     Ok(state)
 }
 
+fn get_bilibili_room_info(target: &str, raw_cookie: &str) -> Result<BilibiliRoomInfoData, String> {
+    let room_id = extract_bilibili_room_id(target).ok_or_else(|| "无法识别 B 站直播间房间号".to_string())?;
+    let url = format!(
+        "https://api.live.bilibili.com/room/v1/Room/get_info?room_id={room_id}"
+    );
+    let response: BilibiliRoomInfoResponse = serde_json::from_value(fetch_bilibili_json(
+        &url,
+        &build_bilibili_live_url(&room_id),
+        raw_cookie,
+    )?)
+    .map_err(|err| err.to_string())?;
+    Ok(response.data)
+}
+
+fn get_bilibili_anchor_info(room_id: &str, raw_cookie: &str) -> Result<BilibiliAnchorInfo, String> {
+    let url = format!(
+        "https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room?roomid={room_id}"
+    );
+    let response: BilibiliAnchorInfoResponse = serde_json::from_value(fetch_bilibili_json(
+        &url,
+        &build_bilibili_live_url(room_id),
+        raw_cookie,
+    )?)
+    .map_err(|err| err.to_string())?;
+    Ok(response.data.info)
+}
+
+fn bilibili_cover(room_info: &BilibiliRoomInfoData) -> String {
+    if !room_info.user_cover.trim().is_empty() {
+        room_info.user_cover.clone()
+    } else {
+        room_info.keyframe.clone()
+    }
+}
+
+fn fetch_bilibili_room_state(target: &str, raw_cookie: &str) -> Result<ExtractResult, String> {
+    let room_info = get_bilibili_room_info(target, raw_cookie)?;
+    let room_id = room_info.room_id.clone();
+    let anchor = get_bilibili_anchor_info(&room_id, raw_cookie).unwrap_or(BilibiliAnchorInfo {
+        uname: String::new(),
+        face: String::new(),
+    });
+    let is_online = room_info.live_status == 1;
+    let room_url = build_bilibili_live_url(&room_id);
+
+    Ok(ExtractResult {
+        platform: PLATFORM_BILIBILI_LIVE.to_string(),
+        room_id: room_id.clone(),
+        streamer_name: if anchor.uname.trim().is_empty() {
+            room_info.title.clone()
+        } else {
+            anchor.uname
+        },
+        room_name: room_info.title.clone(),
+        avatar_url: anchor.face,
+        is_online,
+        screenshot_url: if is_online {
+            bilibili_cover(&room_info)
+        } else {
+            String::new()
+        },
+        heat_text: if is_online {
+            room_info.online.clone()
+        } else {
+            String::new()
+        },
+        page_url: room_url.clone(),
+        title: room_info.title,
+        urls: Vec::new(),
+    })
+}
+
+fn bilibili_codec_urls(codec: &BilibiliPlayCodec) -> Vec<String> {
+    codec.url_info
+        .iter()
+        .filter(|info| !info.host.trim().is_empty())
+        .map(|info| format!("{}{}{}", info.host, codec.base_url, info.extra))
+        .collect()
+}
+
+fn bilibili_codec_quality(codec: &BilibiliPlayCodec) -> i64 {
+    let current = codec.current_qn;
+    if current > 0 {
+        current
+    } else {
+        codec.accept_qn.iter().copied().max().unwrap_or_default()
+    }
+}
+
+fn bilibili_protocol_rank(protocol_name: &str) -> i32 {
+    match protocol_name {
+        "http_stream" => 2,
+        "http_hls" => 1,
+        _ => 0,
+    }
+}
+
+fn bilibili_format_rank(format_name: &str) -> i32 {
+    match format_name {
+        "flv" => 2,
+        "fmp4" => 1,
+        _ => 0,
+    }
+}
+
+fn bilibili_codec_rank(codec_name: &str) -> i32 {
+    match codec_name {
+        "avc" => 2,
+        "hevc" => 1,
+        _ => 0,
+    }
+}
+
+fn select_bilibili_urls(playurl: &BilibiliPlayurl) -> Vec<String> {
+    let mut best_score = None::<(i64, i32, i32, i32)>;
+    let mut best_urls = Vec::new();
+
+    for stream in &playurl.stream {
+        let protocol_rank = bilibili_protocol_rank(&stream.protocol_name);
+        for format in &stream.formats {
+            let format_rank = bilibili_format_rank(&format.format_name);
+            for codec in &format.codecs {
+                let urls = bilibili_codec_urls(codec);
+                if urls.is_empty() {
+                    continue;
+                }
+
+                let score = (
+                    bilibili_codec_quality(codec),
+                    protocol_rank,
+                    format_rank,
+                    bilibili_codec_rank(&codec.codec_name),
+                );
+
+                if best_score.as_ref().map(|best| score > *best).unwrap_or(true) {
+                    best_score = Some(score);
+                    best_urls = urls;
+                }
+            }
+        }
+    }
+
+    best_urls
+}
+
+fn fetch_bilibili_room_play_info(room_id: &str, qn: i64, raw_cookie: &str) -> Result<Vec<String>, String> {
+    let url = format!(
+        "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id={room_id}&protocol=0,1&format=0,1,2&codec=0,1&qn={qn}&platform=web&ptype=8&dolby=5"
+    );
+    let response: BilibiliRoomPlayInfoResponse = serde_json::from_value(fetch_bilibili_json(
+        &url,
+        &build_bilibili_live_url(room_id),
+        raw_cookie,
+    )?)
+    .map_err(|err| err.to_string())?;
+
+    if response.data.encrypted && !response.data.pwd_verified {
+        return Err("该 B 站直播间需要密码验证".to_string());
+    }
+
+    let urls = select_bilibili_urls(&response.data.playurl_info.playurl);
+    if urls.is_empty() {
+        return Err("未获取到 B 站直播播放线路".to_string());
+    }
+    Ok(urls)
+}
+
+fn fetch_bilibili_old_play_url(room_id: &str, qn: i64, raw_cookie: &str) -> Result<Vec<String>, String> {
+    let url = format!(
+        "https://api.live.bilibili.com/room/v1/Room/playUrl?cid={room_id}&qn={qn}&platform=web"
+    );
+    let response: BilibiliOldPlayUrlResponse = serde_json::from_value(fetch_bilibili_json(
+        &url,
+        &build_bilibili_live_url(room_id),
+        raw_cookie,
+    )?)
+    .map_err(|err| err.to_string())?;
+    let urls = response
+        .data
+        .durl
+        .into_iter()
+        .filter_map(|item| if item.url.trim().is_empty() { None } else { Some(item.url) })
+        .collect::<Vec<_>>();
+    if urls.is_empty() {
+        return Err("未获取到 B 站旧版播放线路".to_string());
+    }
+    Ok(urls)
+}
+
+fn extract_json_from_script(html: &str, prefix: &str, suffix: &str) -> Option<String> {
+    let start = html.find(prefix)?;
+    let remain = &html[start + prefix.len()..];
+    let end = remain.find(suffix)?;
+    Some(remain[..end].to_string())
+}
+
+fn fetch_bilibili_html_play_url(room_id: &str, raw_cookie: &str) -> Result<Vec<String>, String> {
+    let room_url = build_bilibili_live_url(room_id);
+    let html = {
+        let client = bilibili_client()?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(BILIBILI_USER_AGENT).map_err(|err| err.to_string())?,
+        );
+        headers.insert(REFERER, HeaderValue::from_str(&room_url).map_err(|err| err.to_string())?);
+        if let Some(cookie_header) = build_bilibili_cookie_header(raw_cookie)? {
+            headers.insert(reqwest::header::COOKIE, cookie_header);
+        }
+        client
+            .get(&room_url)
+            .headers(headers)
+            .send()
+            .map_err(|err| err.to_string())?
+            .text()
+            .map_err(|err| err.to_string())?
+    };
+
+    let json_text = extract_json_from_script(&html, "<script>window.__NEPTUNE_IS_MY_WAIFU__=", "</script>")
+        .ok_or_else(|| "未找到 B 站直播页面初始化数据".to_string())?;
+    let json: Value = serde_json::from_str(&json_text).map_err(|err| err.to_string())?;
+    let playurl = &json["roomInitRes"]["data"]["playurl_info"]["playurl"];
+    let playurl: BilibiliPlayurl = serde_json::from_value(playurl.clone()).map_err(|err| err.to_string())?;
+    let urls = select_bilibili_urls(&playurl);
+    if urls.is_empty() {
+        return Err("未从 B 站页面解析到播放线路".to_string());
+    }
+    Ok(urls)
+}
+
+fn extract_bilibili_play_info(target: &str, raw_cookie: &str) -> Result<ExtractResult, String> {
+    let mut state = fetch_bilibili_room_state(target, raw_cookie)?;
+    if !state.is_online {
+        return Ok(state);
+    }
+    let room_id = state.room_id.clone();
+
+    let urls = fetch_bilibili_room_play_info(&room_id, 30000, raw_cookie)
+        .or_else(|_| fetch_bilibili_old_play_url(&room_id, 30000, raw_cookie))
+        .or_else(|_| fetch_bilibili_html_play_url(&room_id, raw_cookie))?;
+    state.urls = urls;
+    if state.title.trim().is_empty() {
+        state.title = state.room_name.clone();
+    }
+    Ok(state)
+}
+
+fn fetch_room_state_for_platform(platform: &str, target: &str) -> Result<ExtractResult, String> {
+    match normalize_platform(platform) {
+        PLATFORM_BILIBILI_LIVE => fetch_bilibili_room_state(target, ""),
+        _ => fetch_douyu_room_state(target),
+    }
+}
+
+fn fetch_room_state(target: &str) -> Result<ExtractResult, String> {
+    fetch_room_state_for_platform(infer_platform_from_target(target), target)
+}
+
+fn extract_play_info_for_platform(
+    platform: &str,
+    target: &str,
+    bilibili_cookie: &str,
+) -> Result<ExtractResult, String> {
+    match normalize_platform(platform) {
+        PLATFORM_BILIBILI_LIVE => extract_bilibili_play_info(target, bilibili_cookie),
+        _ => extract_douyu_play_info(target),
+    }
+}
+
+fn settings_file(app: &AppHandle) -> Result<PathBuf, String> {
+    app_data_file(app, "settings.json")
+}
+
+fn load_settings_inner(app: &AppHandle) -> Result<Settings, String> {
+    let path = settings_file(app)?;
+    read_json_or_default(&path)
+}
+
+fn save_settings_inner(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+    let path = settings_file(app)?;
+    write_json(&path, settings)
+}
+
+fn has_bilibili_login(cookie: &str) -> bool {
+    cookie
+        .split(';')
+        .map(str::trim)
+        .any(|part| part.starts_with("SESSDATA=") && part.len() > "SESSDATA=".len())
+}
+
+#[cfg(target_os = "macos")]
+fn extract_bilibili_cookie_from_window<R: tauri::Runtime>(
+    window: &WebviewWindow<R>,
+) -> Result<Option<String>, String> {
+    let (tx, rx) = mpsc::channel();
+    window
+        .with_webview(move |webview| unsafe {
+            let view: &WKWebView = &*webview.inner().cast();
+            let store = view.configuration().websiteDataStore().httpCookieStore();
+            let tx = tx.clone();
+            let block = RcBlock::new(move |cookies_ptr: NonNull<NSArray<NSHTTPCookie>>| {
+                let cookies = cookies_ptr.as_ref();
+                let mut parts = Vec::new();
+                for index in 0..cookies.len() {
+                    let cookie = cookies.objectAtIndex(index);
+                    let domain = cookie.domain().to_string();
+                    if !domain.contains("bilibili.com") {
+                        continue;
+                    }
+                    let name = cookie.name().to_string();
+                    let value = cookie.value().to_string();
+                    if name.is_empty() || value.is_empty() {
+                        continue;
+                    }
+                    parts.push(format!("{name}={value}"));
+                }
+                let joined = parts.join("; ");
+                let _ = tx.send(joined);
+            });
+            store.getAllCookies(&block);
+        })
+        .map_err(|err| err.to_string())?;
+
+    let cookie = rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "读取 B站 登录 Cookie 超时".to_string())?;
+    if has_bilibili_login(&cookie) {
+        Ok(Some(cookie))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn extract_bilibili_cookie_from_window<R: tauri::Runtime>(
+    _window: &WebviewWindow<R>,
+) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+fn save_bilibili_cookie_and_notify(
+    app: &AppHandle,
+    cookie: String,
+) -> Result<Settings, String> {
+    let mut settings = load_settings_inner(app)?;
+    settings.bilibili_cookie = cookie;
+    save_settings_inner(app, &settings)?;
+    app.emit("bilibili-login-updated", &settings)
+        .map_err(|err| err.to_string())?;
+    Ok(settings)
+}
+
+fn clear_bilibili_cookie_and_notify(app: &AppHandle) -> Result<Settings, String> {
+    let mut settings = load_settings_inner(app)?;
+    settings.bilibili_cookie.clear();
+    save_settings_inner(app, &settings)?;
+    app.emit("bilibili-login-updated", &settings)
+        .map_err(|err| err.to_string())?;
+    Ok(settings)
+}
+
+fn maybe_capture_bilibili_login<R: tauri::Runtime>(
+    app: AppHandle,
+    window: WebviewWindow<R>,
+) {
+    match extract_bilibili_cookie_from_window(&window) {
+        Ok(Some(cookie)) => {
+            if save_bilibili_cookie_and_notify(&app, cookie).is_ok() {
+                let _ = window.close();
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            let _ = app.emit("bilibili-login-error", err);
+        }
+    }
+}
+
+fn bilibili_login_url() -> &'static str {
+    "https://passport.bilibili.com/login"
+}
+
+fn spawn_bilibili_login_watcher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        for _ in 0..180 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let Some(window) = app.get_webview_window("bilibili-login") else {
+                break;
+            };
+
+            match extract_bilibili_cookie_from_window(&window) {
+                Ok(Some(cookie)) => {
+                    if save_bilibili_cookie_and_notify(&app, cookie).is_ok() {
+                        let _ = window.close();
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let _ = app.emit("bilibili-login-error", err);
+                }
+            }
+        }
+    });
+}
+
 fn write_playlist(title: &str, urls: &[String]) -> Result<PathBuf, String> {
     let safe_title = if title.trim().is_empty() {
-        "Douyu Live".to_string()
+        "Stream Hub Live".to_string()
     } else {
         title.trim().to_string()
     };
@@ -721,7 +1489,7 @@ fn write_playlist(title: &str, urls: &[String]) -> Result<PathBuf, String> {
         content.push(url.clone());
     }
 
-    let path = env::temp_dir().join("stream-hub-douyu.m3u");
+    let path = env::temp_dir().join(format!("stream-hub-{}.m3u", Uuid::new_v4()));
     fs::write(&path, content.join("\n") + "\n").map_err(|err| err.to_string())?;
     Ok(path)
 }
@@ -781,12 +1549,16 @@ fn escape_mpv_script_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn build_mpv_script_opts(media_title: &str) -> String {
-    let options = [
-        ("force-media-title", media_title),
-        ("ytdl", "no"),
-        ("stream-lavf-o", "reconnect_streamed=yes"),
+fn build_mpv_script_opts(data: &ExtractResult, media_title: &str) -> String {
+    let mut options = vec![
+        ("force-media-title", media_title.to_string()),
+        ("ytdl", "no".to_string()),
+        ("stream-lavf-o", "reconnect_streamed=yes".to_string()),
     ];
+
+    if data.platform == PLATFORM_BILIBILI_LIVE {
+        options.push(("referrer", "https://live.bilibili.com/".to_string()));
+    }
 
     options
         .iter()
@@ -802,7 +1574,7 @@ fn encode_hex(data: &[u8]) -> String {
 fn build_iina_plus_args(data: &ExtractResult, media_title: &str, port: u16) -> Result<String, String> {
     let payload = IinaPlusArgs {
         raw_url: data.page_url.clone(),
-        mpv_script: build_mpv_script_opts(media_title),
+        mpv_script: build_mpv_script_opts(data, media_title),
         port,
         urls: data.urls.clone(),
         r#type: 0,
@@ -980,6 +1752,34 @@ fn locate_danmaku_bridge_script(app: &AppHandle) -> Result<PathBuf, String> {
         .ok_or_else(|| "未找到斗鱼弹幕桥接脚本。".to_string())
 }
 
+fn locate_resource_file(app: &AppHandle, file_name: &str) -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("resources").join(file_name));
+        candidates.push(resource_dir.join(file_name));
+    }
+
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join(file_name));
+
+    if let Ok(current_dir) = env::current_dir() {
+        candidates.push(current_dir.join("src-tauri/resources").join(file_name));
+        candidates.push(current_dir.join("resources").join(file_name));
+    }
+
+    candidates
+        .into_iter()
+        .find(|path| path.exists() && path.is_file())
+        .ok_or_else(|| format!("未找到资源文件：{file_name}"))
+}
+
+fn resource_file_to_data_url(app: &AppHandle, file_name: &str) -> Result<String, String> {
+    let path = locate_resource_file(app, file_name)?;
+    let bytes = fs::read(path).map_err(|err| err.to_string())?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:image/x-icon;base64,{encoded}"))
+}
+
 fn enable_xjbeta_iina_plugin() -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -1121,7 +1921,12 @@ fn open_iina_playlist(
 ) -> Result<(), String> {
     let iina_cli = detect_iina_cli(settings)?;
     let iina_process_name = iina_process_name_from_cli(&iina_cli);
-    if settings.enable_iina_danmaku {
+    let enable_danmaku = settings.enable_iina_danmaku
+        && matches!(
+            data.platform.as_str(),
+            PLATFORM_DOUYU | PLATFORM_BILIBILI_LIVE
+        );
+    if enable_danmaku {
         enable_iina_plugin_system()?;
         enable_xjbeta_iina_plugin()?;
     }
@@ -1131,7 +1936,7 @@ fn open_iina_playlist(
     command.arg("--mpv-pause=no");
     command.arg("--mpv-force-window=immediate");
 
-    if settings.enable_iina_danmaku {
+    if enable_danmaku {
         let danmaku_port = ensure_danmaku_server(app)?;
         let args_hex = build_iina_plus_args(data, media_title, danmaku_port)?;
         let checker = args_hex
@@ -1150,6 +1955,9 @@ fn open_iina_playlist(
         command.arg("--mpv-ytdl=no");
         command.arg("--mpv-stream-lavf-o=reconnect_streamed=yes");
         command.arg(format!("--mpv-force-media-title={media_title}"));
+        if data.platform == PLATFORM_BILIBILI_LIVE {
+            command.arg("--mpv-referrer=https://live.bilibili.com/");
+        }
         command.arg(playlist_path);
     }
 
@@ -1164,6 +1972,7 @@ fn open_iina_playlist(
 fn open_mpv_playlist(
     playlist_path: &Path,
     media_title: &str,
+    data: &ExtractResult,
     settings: &Settings,
 ) -> Result<(), String> {
     let mpv_bin = detect_mpv(settings)?;
@@ -1171,6 +1980,9 @@ fn open_mpv_playlist(
     command.arg("--ytdl=no");
     command.arg("--stream-lavf-o=reconnect_streamed=yes");
     command.arg(format!("--force-media-title={media_title}"));
+    if data.platform == PLATFORM_BILIBILI_LIVE {
+        command.arg("--referrer=https://live.bilibili.com/");
+    }
     command.arg(playlist_path);
     command.stdin(Stdio::null());
     command.stdout(Stdio::null());
@@ -1226,12 +2038,22 @@ async fn handle_danmaku_websocket(
     Query(query): Query<DanmakuWsQuery>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
-        let _ = proxy_douyu_danmaku(socket, query.room_id, state).await;
+        let _ = proxy_live_danmaku(socket, query.platform, query.room_id, state).await;
     })
 }
 
-fn parse_room_id_from_client_message(message: &str) -> Option<String> {
-    let payload = if let Some(raw) = message.strip_prefix("iinaDM://") {
+fn parse_danmaku_target_from_client_message(message: &str) -> Option<(String, String)> {
+    let payload = if let Some(raw) = message.strip_prefix("iinaWebDM://") {
+        if let Some((prefix, url)) = raw.split_once('&') {
+            if prefix.starts_with("v=") {
+                url
+            } else {
+                raw
+            }
+        } else {
+            raw
+        }
+    } else if let Some(raw) = message.strip_prefix("iinaDM://") {
         if let Some((prefix, url)) = raw.split_once('&') {
             if prefix.starts_with("v=") {
                 url
@@ -1245,11 +2067,18 @@ fn parse_room_id_from_client_message(message: &str) -> Option<String> {
         message
     };
 
-    extract_room_id_from_target(payload)
+    let platform = infer_platform_from_target(payload).to_string();
+    let room_id = if platform == PLATFORM_BILIBILI_LIVE {
+        extract_bilibili_room_id(payload)
+    } else {
+        extract_room_id_from_target(payload)
+    }?;
+    Some((platform, room_id))
 }
 
-async fn proxy_douyu_danmaku(
+async fn proxy_live_danmaku(
     mut client_stream: WebSocket,
+    initial_platform: String,
     initial_room_id: String,
     state: DanmakuHttpState,
 ) -> Result<(), String> {
@@ -1260,14 +2089,19 @@ async fn proxy_douyu_danmaku(
         .await
         .map_err(|err| err.to_string())?;
 
-    let room_id = if !initial_room_id.trim().is_empty() {
-        initial_room_id
+    let (platform, room_id) = if !initial_room_id.trim().is_empty() {
+        (
+            normalize_platform(&initial_platform).to_string(),
+            initial_room_id,
+        )
     } else {
         let mut parsed_room_id = String::new();
+        let mut parsed_platform = PLATFORM_DOUYU.to_string();
         while let Some(Ok(message)) = client_stream.next().await {
             match message {
                 AxumMessage::Text(text) => {
-                    if let Some(room_id) = parse_room_id_from_client_message(&text) {
+                    if let Some((platform, room_id)) = parse_danmaku_target_from_client_message(&text) {
+                        parsed_platform = platform;
                         parsed_room_id = room_id;
                         break;
                     }
@@ -1276,7 +2110,7 @@ async fn proxy_douyu_danmaku(
                 _ => {}
             }
         }
-        parsed_room_id
+        (parsed_platform, parsed_room_id)
     };
 
     if room_id.is_empty() {
@@ -1290,6 +2124,7 @@ async fn proxy_douyu_danmaku(
 
     let mut child = TokioCommand::new(&state.node_bin)
         .arg(&state.bridge_script)
+        .arg(&platform)
         .arg(&room_id)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1300,7 +2135,7 @@ async fn proxy_douyu_danmaku(
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "斗鱼弹幕桥接未输出 stdout。".to_string())?;
+        .ok_or_else(|| "弹幕桥接未输出 stdout。".to_string())?;
     let mut lines = BufReader::new(stdout).lines();
 
     while let Some(line) = lines.next_line().await.map_err(|err| err.to_string())? {
@@ -1326,7 +2161,7 @@ async fn proxy_douyu_danmaku(
     Ok(())
 }
 
-fn search_streamers_inner(keyword: &str) -> Result<Vec<SearchStreamer>, String> {
+fn search_douyu_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, String> {
     let query = keyword.trim();
     if query.is_empty() {
         return Err("Missing keyword".into());
@@ -1351,6 +2186,7 @@ fn search_streamers_inner(keyword: &str) -> Result<Vec<SearchStreamer>, String> 
         let is_online = anchor.is_live == 1;
         let mut result = SearchStreamer {
             name,
+            platform: PLATFORM_DOUYU.to_string(),
             target: room_id.clone(),
             room_id,
             room_name: anchor.description,
@@ -1373,6 +2209,89 @@ fn search_streamers_inner(keyword: &str) -> Result<Vec<SearchStreamer>, String> 
     }
 
     Ok(results)
+}
+
+fn search_bilibili_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, String> {
+    let query = keyword.trim();
+    if query.is_empty() {
+        return Err("Missing keyword".into());
+    }
+
+    let items = fetch_bilibili_search(query)?;
+    let room_ids = items
+        .iter()
+        .map(|item| item.roomid.clone())
+        .filter(|room_id| !room_id.trim().is_empty())
+        .collect::<Vec<_>>();
+    let room_infos = fetch_bilibili_room_base_infos(&room_ids).unwrap_or_default();
+
+    let mut results = Vec::new();
+    for item in items {
+        if item.roomid.trim().is_empty() || item.uname.trim().is_empty() {
+            continue;
+        }
+        let room_id = item.roomid.trim().to_string();
+        let room_info = room_infos
+            .get(&room_id)
+            .or_else(|| room_infos.values().find(|info| info.short_id == room_id));
+        let is_online = room_info
+            .map(|info| info.live_status == 1)
+            .unwrap_or(item.live_status == 1);
+        results.push(SearchStreamer {
+            name: strip_html_tags(&item.uname).trim().to_string(),
+            platform: PLATFORM_BILIBILI_LIVE.to_string(),
+            target: build_bilibili_live_url(&room_id),
+            room_id,
+            room_name: room_info.map(|info| info.title.clone()).unwrap_or_default(),
+            avatar_url: item.uface,
+            is_online,
+            screenshot_url: if is_online {
+                room_info.map(|info| info.cover.clone()).unwrap_or_default()
+            } else {
+                String::new()
+            },
+            heat_text: if is_online {
+                room_info.map(|info| info.online.clone()).unwrap_or_default()
+            } else {
+                String::new()
+            },
+        });
+    }
+    Ok(results)
+}
+
+fn search_streamers_inner(keyword: &str) -> Result<Vec<SearchStreamer>, String> {
+    let query = keyword.trim();
+    if query.is_empty() {
+        return Err("Missing keyword".into());
+    }
+
+    let mut results = search_douyu_streamers(query).unwrap_or_default();
+    results.extend(search_bilibili_streamers(query).unwrap_or_default());
+    Ok(results)
+}
+
+fn fetch_bilibili_room_base_infos(room_ids: &[String]) -> Result<HashMap<String, BilibiliRoomBaseInfo>, String> {
+    let ids = room_ids
+        .iter()
+        .filter(|room_id| !room_id.trim().is_empty())
+        .map(|room_id| format!("room_ids={}", urlencoding::encode(room_id)))
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let url = format!(
+        "https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo?{}&req_biz=web_room_componet",
+        ids.join("&")
+    );
+    let response: BilibiliRoomBaseInfoResponse = serde_json::from_value(fetch_bilibili_json(
+        &url,
+        "https://live.bilibili.com/",
+        "",
+    )?)
+    .map_err(|err| err.to_string())?;
+    Ok(response.data.by_room_ids)
 }
 
 fn app_data_file(app: &AppHandle, file_name: &str) -> Result<PathBuf, String> {
@@ -1404,27 +2323,104 @@ where
 #[tauri::command]
 fn load_streamers(app: AppHandle) -> Result<Vec<Streamer>, String> {
     let path = app_data_file(&app, "streamers.json")?;
-    read_json_or_default(&path)
+    let mut streamers: Vec<Streamer> = read_json_or_default(&path)?;
+    streamers.iter_mut().for_each(ensure_streamer_platform);
+    Ok(streamers)
 }
 
 #[tauri::command]
 fn save_streamers(app: AppHandle, streamers: Vec<Streamer>) -> Result<Vec<Streamer>, String> {
     let path = app_data_file(&app, "streamers.json")?;
+    let mut streamers = streamers;
+    streamers.iter_mut().for_each(ensure_streamer_platform);
     write_json(&path, &streamers)?;
     Ok(streamers)
 }
 
 #[tauri::command]
 fn load_settings(app: AppHandle) -> Result<Settings, String> {
-    let path = app_data_file(&app, "settings.json")?;
-    read_json_or_default(&path)
+    load_settings_inner(&app)
 }
 
 #[tauri::command]
 fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, String> {
-    let path = app_data_file(&app, "settings.json")?;
-    write_json(&path, &settings)?;
+    save_settings_inner(&app, &settings)?;
     Ok(settings)
+}
+
+#[tauri::command]
+fn open_bilibili_login(app: AppHandle) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        return Err("当前仅在 macOS 上支持内置 B站 登录面板".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let login_url = Url::parse(bilibili_login_url()).map_err(|err| err.to_string())?;
+        if let Some(window) = app.get_webview_window("bilibili-login") {
+            let _ = window.show();
+            let _ = window.set_focus();
+            let _ = window.navigate(login_url.clone());
+            spawn_bilibili_login_watcher(app.clone());
+            return Ok(());
+        }
+
+        let app_handle = app.clone();
+        WebviewWindowBuilder::new(
+            &app,
+            "bilibili-login",
+            WebviewUrl::External(login_url),
+        )
+        .title("B站 登录")
+        .inner_size(980.0, 760.0)
+        .resizable(true)
+        .center()
+        .on_page_load(move |window, _payload| {
+            maybe_capture_bilibili_login(app_handle.clone(), window);
+        })
+        .build()
+        .map_err(|err| err.to_string())?;
+        spawn_bilibili_login_watcher(app);
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn refresh_bilibili_login(app: AppHandle) -> Result<Settings, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        return Err("当前仅在 macOS 上支持内置 B站 登录面板".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let window = app
+            .get_webview_window("bilibili-login")
+            .ok_or_else(|| "请先打开 B站 登录面板".to_string())?;
+        if let Some(cookie) = extract_bilibili_cookie_from_window(&window)? {
+            let settings = save_bilibili_cookie_and_notify(&app, cookie)?;
+            let _ = window.close();
+            Ok(settings)
+        } else {
+            Err("当前登录窗口里还没有检测到有效的 B站 登录态".to_string())
+        }
+    }
+}
+
+#[tauri::command]
+fn clear_bilibili_login(app: AppHandle) -> Result<Settings, String> {
+    clear_bilibili_cookie_and_notify(&app)
+}
+
+#[tauri::command]
+fn load_platform_icons(app: AppHandle) -> Result<PlatformIcons, String> {
+    Ok(PlatformIcons {
+        bilibili: resource_file_to_data_url(&app, "bilibili_icon.ico")?,
+        douyu: resource_file_to_data_url(&app, "douyu_icon.ico")?,
+    })
 }
 
 #[tauri::command]
@@ -1455,7 +2451,12 @@ fn resolve_streamer(target: String) -> Result<ResolvedStreamer, String> {
 
     Ok(ResolvedStreamer {
         name: fallback_name,
-        target: parsed.room_id.clone(),
+        platform: parsed.platform.clone(),
+        target: if parsed.platform == PLATFORM_BILIBILI_LIVE {
+            build_bilibili_live_url(&parsed.room_id)
+        } else {
+            parsed.room_id.clone()
+        },
         room_id: parsed.room_id,
         room_name: parsed.room_name,
         streamer_name: parsed.streamer_name,
@@ -1474,10 +2475,60 @@ fn search_streamers(keyword: String) -> Result<Vec<SearchStreamer>, String> {
 #[tauri::command]
 async fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Result<Vec<Streamer>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let mut streamers = streamers;
+        streamers.iter_mut().for_each(ensure_streamer_platform);
+
+        let bili_room_ids = streamers
+            .iter()
+            .filter(|streamer| streamer.platform == PLATFORM_BILIBILI_LIVE)
+            .filter_map(|streamer| extract_bilibili_room_id(&streamer.target))
+            .collect::<Vec<_>>();
+        let bili_infos = fetch_bilibili_room_base_infos(&bili_room_ids).unwrap_or_default();
+
         let updated: Vec<Streamer> = streamers
             .into_iter()
             .map(|mut streamer| {
-                match fetch_room_state(&streamer.target) {
+                if streamer.platform == PLATFORM_BILIBILI_LIVE {
+                    let room_id = extract_bilibili_room_id(&streamer.target).unwrap_or_default();
+                    let info = bili_infos
+                        .get(&room_id)
+                        .or_else(|| bili_infos.values().find(|item| item.short_id == room_id));
+
+                    if let Some(info) = info {
+                        let is_online = info.live_status == 1;
+                        streamer.target = if info.live_url.trim().is_empty() {
+                            build_bilibili_live_url(&info.room_id)
+                        } else {
+                            info.live_url.clone()
+                        };
+                        streamer.is_online = Some(is_online);
+                        if !info.uname.trim().is_empty() {
+                            streamer.name = info.uname.clone();
+                        }
+                        if is_online {
+                            streamer.screenshot_url = if info.cover.trim().is_empty() {
+                                None
+                            } else {
+                                Some(info.cover.clone())
+                            };
+                            streamer.heat_text = if info.online.trim().is_empty() {
+                                None
+                            } else {
+                                Some(info.online.clone())
+                            };
+                        } else {
+                            streamer.screenshot_url = None;
+                            streamer.heat_text = None;
+                        }
+                    } else {
+                        streamer.is_online = Some(false);
+                        streamer.screenshot_url = None;
+                        streamer.heat_text = None;
+                    }
+                    return streamer;
+                }
+
+                match fetch_douyu_room_state(&streamer.target) {
                     Ok(parsed) => {
                         streamer.is_online = Some(parsed.is_online);
                         if !parsed.avatar_url.trim().is_empty() {
@@ -1517,7 +2568,12 @@ async fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Resu
 
 #[tauri::command]
 fn play_streamer(app: AppHandle, streamer: Streamer, settings: Settings) -> Result<(), String> {
-    let data = extract_play_info(&streamer.target)?;
+    let platform = if streamer.platform.trim().is_empty() {
+        infer_platform_from_target(&streamer.target).to_string()
+    } else {
+        normalize_platform(&streamer.platform).to_string()
+    };
+    let data = extract_play_info_for_platform(&platform, &streamer.target, &settings.bilibili_cookie)?;
     if !data.is_online {
         return Err("主播当前未开播".into());
     }
@@ -1527,14 +2583,14 @@ fn play_streamer(app: AppHandle, streamer: Streamer, settings: Settings) -> Resu
 
     let playlist_path = write_playlist(&data.title, &data.urls)?;
     let media_title = if data.title.trim().is_empty() {
-        "Douyu Live".to_string()
+        "Stream Hub Live".to_string()
     } else {
         data.title.clone()
     };
 
     match normalize_player(&settings).as_str() {
         "iina" => open_iina_playlist(&app, &settings, &playlist_path, &media_title, &data),
-        _ => open_mpv_playlist(&playlist_path, &media_title, &settings),
+        _ => open_mpv_playlist(&playlist_path, &media_title, &data, &settings),
     }
 }
 
@@ -1547,8 +2603,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_streamers,
             save_streamers,
+            load_platform_icons,
             load_settings,
             save_settings,
+            open_bilibili_login,
+            refresh_bilibili_login,
+            clear_bilibili_login,
             install_iina_danmaku_plugin,
             resolve_streamer,
             search_streamers,

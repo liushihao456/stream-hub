@@ -1,11 +1,30 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 const tabs = [
   { id: "favorites", label: "收藏" },
   { id: "search", label: "搜索" },
   { id: "settings", label: "设置" },
 ];
+
+function PlatformIcon({ platform, iconUrls }) {
+  const isBilibili = platform === "bilibili_live";
+  const label = isBilibili ? "B站" : "斗鱼";
+  const iconUrl = isBilibili ? iconUrls.bilibili : iconUrls.douyu;
+
+  return (
+    <span className={`platform-icon ${isBilibili ? "bilibili" : "douyu"}`} aria-label={label} title={label}>
+      {iconUrl ? (
+        <img className="platform-icon-image" src={iconUrl} alt="" aria-hidden="true" />
+      ) : (
+        <span className="platform-icon-fallback" aria-hidden="true">
+          {label}
+        </span>
+      )}
+    </span>
+  );
+}
 
 function RefreshIcon() {
   return (
@@ -38,6 +57,7 @@ function getImageForStreamer(streamer) {
 
 function StreamerCard({
   streamer,
+  iconUrls,
   menuId,
   openMenuId,
   setOpenMenuId,
@@ -103,6 +123,7 @@ function StreamerCard({
         </div>
       </details>
       <div className="avatar-wrap">
+        <PlatformIcon platform={streamer.platform} iconUrls={iconUrls} />
         {imageUrl ? (
           <img className="avatar-image" src={imageUrl} alt={streamer.name} />
         ) : (
@@ -131,6 +152,7 @@ function StreamerGroup({
   title,
   streamers,
   emptyText,
+  iconUrls,
   getMenuProps,
   openMenuId,
   setOpenMenuId,
@@ -152,6 +174,7 @@ function StreamerGroup({
               <StreamerCard
                 key={menu.menuId}
                 streamer={streamer}
+                iconUrls={iconUrls}
                 menuId={menu.menuId}
                 openMenuId={openMenuId}
                 setOpenMenuId={setOpenMenuId}
@@ -171,10 +194,12 @@ function StreamerGroup({
 
 function App() {
   const [streamers, setStreamers] = useState([]);
+  const [platformIconUrls, setPlatformIconUrls] = useState({ bilibili: "", douyu: "" });
   const [settings, setSettings] = useState({
     player: "iina",
     iinaPath: "",
     mpvPath: "",
+    bilibiliCookie: "",
     enableIinaDanmaku: true,
   });
   const [activeTab, setActiveTab] = useState("favorites");
@@ -191,9 +216,25 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let unlistenUpdated;
+    let unlistenError;
 
     async function bootstrap() {
       try {
+        const icons = await invoke("load_platform_icons");
+        if (!cancelled) {
+          setPlatformIconUrls(icons);
+        }
+
+        unlistenUpdated = await listen("bilibili-login-updated", event => {
+          setSettings(event.payload);
+          setMessage("已更新 B站 登录态");
+          setError("");
+        });
+        unlistenError = await listen("bilibili-login-error", event => {
+          setError(String(event.payload));
+        });
+
         const [savedStreamers, savedSettings] = await Promise.all([
           invoke("load_streamers"),
           invoke("load_settings"),
@@ -224,6 +265,8 @@ function App() {
     bootstrap();
     return () => {
       cancelled = true;
+      unlistenUpdated?.();
+      unlistenError?.();
     };
   }, []);
 
@@ -259,9 +302,37 @@ function App() {
     }
   }
 
+  async function handleOpenBilibiliLogin() {
+    setError("");
+    setMessage("");
+    try {
+      await invoke("open_bilibili_login");
+      setMessage("已打开 B站 登录窗口。登录成功后会自动保存。");
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function handleClearBilibiliLogin() {
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      const saved = await invoke("clear_bilibili_login");
+      setSettings(saved);
+      setMessage("已清除 B站 登录态");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
   function isFavorited(streamer) {
     return streamers.some(
-      favorite => favorite.target === streamer.target || favorite.name === streamer.name,
+      favorite =>
+        (favorite.platform || "douyu") === (streamer.platform || "douyu")
+        && favorite.target === streamer.target,
     );
   }
 
@@ -276,6 +347,7 @@ function App() {
       {
         id: crypto.randomUUID(),
         name: streamer.name,
+        platform: streamer.platform || "douyu",
         target: streamer.target,
         avatarUrl: streamer.avatarUrl || null,
         isOnline: streamer.isOnline,
@@ -346,6 +418,7 @@ function App() {
         streamer: {
           id: streamer.id || crypto.randomUUID(),
           name: streamer.name,
+          platform: streamer.platform || "douyu",
           target: streamer.target,
           avatarUrl: streamer.avatarUrl || null,
           isOnline: streamer.isOnline ?? false,
@@ -356,20 +429,6 @@ function App() {
       });
     } catch (err) {
       setError(String(err));
-    }
-  }
-
-  async function handleInstallIinaPlugin() {
-    setSaving(true);
-    setError("");
-    setMessage("");
-    try {
-      const result = await invoke("install_iina_danmaku_plugin");
-      setMessage(result);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setSaving(false);
     }
   }
 
@@ -438,6 +497,7 @@ function App() {
                 title="已开播"
                 streamers={liveStreamers}
                 emptyText="当前没有已开播的主播"
+                iconUrls={platformIconUrls}
                 openMenuId={openMenuId}
                 setOpenMenuId={setOpenMenuId}
                 onPlay={handlePlay}
@@ -453,6 +513,7 @@ function App() {
                 title="未开播"
                 streamers={offlineStreamers}
                 emptyText="当前没有未开播的主播"
+                iconUrls={platformIconUrls}
                 openMenuId={openMenuId}
                 setOpenMenuId={setOpenMenuId}
                 onPlay={handlePlay}
@@ -473,7 +534,7 @@ function App() {
               <input
                 value={searchInput}
                 onChange={event => setSearchInput(event.target.value)}
-                placeholder="输入主播名字 例如：软软甜"
+                placeholder="输入主播名字 例如：软软甜 / 某幻君"
               />
             </label>
             <button type="submit" disabled={searching}>
@@ -491,11 +552,12 @@ function App() {
                 title="已开播"
                 streamers={liveSearchResults}
                 emptyText="没有匹配的已开播主播"
+                iconUrls={platformIconUrls}
                 openMenuId={openMenuId}
                 setOpenMenuId={setOpenMenuId}
                 onPlay={handlePlay}
                 getMenuProps={streamer => ({
-                  menuId: `search:${streamer.target}`,
+                  menuId: `search:${streamer.platform}:${streamer.target}`,
                   label: isFavorited(streamer) ? "已收藏" : "收藏",
                   disabled: isFavorited(streamer),
                   onAction: async () => {
@@ -509,11 +571,12 @@ function App() {
                 title="未开播"
                 streamers={offlineSearchResults}
                 emptyText="没有匹配的未开播主播"
+                iconUrls={platformIconUrls}
                 openMenuId={openMenuId}
                 setOpenMenuId={setOpenMenuId}
                 onPlay={handlePlay}
                 getMenuProps={streamer => ({
-                  menuId: `search:${streamer.target}`,
+                  menuId: `search:${streamer.platform}:${streamer.target}`,
                   label: isFavorited(streamer) ? "已收藏" : "收藏",
                   disabled: isFavorited(streamer),
                   onAction: async () => {
@@ -571,6 +634,21 @@ function App() {
                 保存
               </button>
             </div>
+            <div className="player-extra">
+              <div className="login-status-row compact">
+                <span className={`login-state ${settings.bilibiliCookie?.includes("SESSDATA=") ? "online" : "offline"}`}>
+                  {settings.bilibiliCookie?.includes("SESSDATA=") ? "B站 已登录" : "B站 未登录"}
+                </span>
+                <div className="login-actions">
+                  <button type="button" className="ghost-button" disabled={saving} onClick={handleOpenBilibiliLogin}>
+                    打开 B站 登录面板
+                  </button>
+                  <button type="button" className="ghost-button" disabled={saving} onClick={handleClearBilibiliLogin}>
+                    清除登录态
+                  </button>
+                </div>
+              </div>
+            </div>
             {settings.player === "iina" ? (
               <div className="player-extra">
                 <label className="toggle-row">
@@ -583,17 +661,15 @@ function App() {
                   />
                   <span>启用 IINA 弹幕</span>
                 </label>
-                <div className="overlay-actions">
-                  <button type="button" className="ghost-button" disabled={saving} onClick={handleInstallIinaPlugin}>
-                    安装或更新 IINA 弹幕插件
-                  </button>
-                </div>
                 <p className="settings-hint">
                   选择 IINA 时，播放前会自动安装并更新内置弹幕插件。mpv 模式只播放直播，不显示弹幕。
                 </p>
+                <p className="settings-hint">
+                  B站高画质通常需要登录态。可以直接用上面的登录面板完成登录。
+                </p>
               </div>
             ) : (
-              <p className="settings-hint">mpv 模式当前不启用弹幕。</p>
+              <p className="settings-hint">mpv 模式当前不启用弹幕。B站高画质同样可以使用上面的登录面板。</p>
             )}
           </div>
         </section>
