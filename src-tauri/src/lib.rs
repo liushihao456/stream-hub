@@ -1092,11 +1092,45 @@ fn get_bilibili_anchor_info(room_id: &str, raw_cookie: &str) -> Result<BilibiliA
     Ok(response.data.info)
 }
 
+fn normalize_remote_image_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        return format!("https://{rest}");
+    }
+    if let Some(rest) = trimmed.strip_prefix("//") {
+        return format!("https://{rest}");
+    }
+    trimmed.to_string()
+}
+
+fn resolve_bilibili_avatar(
+    room_id: &str,
+    current_avatar: &str,
+    fallback_avatar: &str,
+    raw_cookie: &str,
+) -> String {
+    if !current_avatar.trim().is_empty() {
+        return normalize_remote_image_url(current_avatar);
+    }
+
+    let anchor_avatar = get_bilibili_anchor_info(room_id, raw_cookie)
+        .map(|anchor| anchor.face.trim().to_string())
+        .unwrap_or_default();
+    if !anchor_avatar.is_empty() {
+        return normalize_remote_image_url(&anchor_avatar);
+    }
+
+    normalize_remote_image_url(fallback_avatar)
+}
+
 fn bilibili_cover(room_info: &BilibiliRoomInfoData) -> String {
     if !room_info.user_cover.trim().is_empty() {
-        room_info.user_cover.clone()
+        normalize_remote_image_url(&room_info.user_cover)
     } else {
-        room_info.keyframe.clone()
+        normalize_remote_image_url(&room_info.keyframe)
     }
 }
 
@@ -1119,7 +1153,7 @@ fn fetch_bilibili_room_state(target: &str, raw_cookie: &str) -> Result<ExtractRe
             anchor.uname
         },
         room_name: room_info.title.clone(),
-        avatar_url: anchor.face,
+        avatar_url: normalize_remote_image_url(&anchor.face),
         is_online,
         screenshot_url: if is_online {
             bilibili_cover(&room_info)
@@ -2231,6 +2265,7 @@ fn search_bilibili_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, Strin
             continue;
         }
         let room_id = item.roomid.trim().to_string();
+        let avatar_url = resolve_bilibili_avatar(&room_id, "", &item.uface, "");
         let room_info = room_infos
             .get(&room_id)
             .or_else(|| room_infos.values().find(|info| info.short_id == room_id));
@@ -2243,10 +2278,12 @@ fn search_bilibili_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, Strin
             target: build_bilibili_live_url(&room_id),
             room_id,
             room_name: room_info.map(|info| info.title.clone()).unwrap_or_default(),
-            avatar_url: item.uface,
+            avatar_url,
             is_online,
             screenshot_url: if is_online {
-                room_info.map(|info| info.cover.clone()).unwrap_or_default()
+                room_info
+                    .map(|info| normalize_remote_image_url(&info.cover))
+                    .unwrap_or_default()
             } else {
                 String::new()
             },
@@ -2490,6 +2527,7 @@ async fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Resu
             .map(|mut streamer| {
                 if streamer.platform == PLATFORM_BILIBILI_LIVE {
                     let room_id = extract_bilibili_room_id(&streamer.target).unwrap_or_default();
+                    let current_avatar = streamer.avatar_url.clone().unwrap_or_default();
                     let info = bili_infos
                         .get(&room_id)
                         .or_else(|| bili_infos.values().find(|item| item.short_id == room_id));
@@ -2505,11 +2543,15 @@ async fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Resu
                         if !info.uname.trim().is_empty() {
                             streamer.name = info.uname.clone();
                         }
+                        let avatar_url = resolve_bilibili_avatar(&room_id, &current_avatar, "", "");
+                        if !avatar_url.is_empty() {
+                            streamer.avatar_url = Some(avatar_url);
+                        }
                         if is_online {
                             streamer.screenshot_url = if info.cover.trim().is_empty() {
                                 None
                             } else {
-                                Some(info.cover.clone())
+                                Some(normalize_remote_image_url(&info.cover))
                             };
                             streamer.heat_text = if info.online.trim().is_empty() {
                                 None
@@ -2522,6 +2564,10 @@ async fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Resu
                         }
                     } else {
                         streamer.is_online = Some(false);
+                        let avatar_url = resolve_bilibili_avatar(&room_id, &current_avatar, "", "");
+                        if !avatar_url.is_empty() {
+                            streamer.avatar_url = Some(avatar_url);
+                        }
                         streamer.screenshot_url = None;
                         streamer.heat_text = None;
                     }
