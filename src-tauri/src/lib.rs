@@ -1055,8 +1055,8 @@ fn extract_douyu_play_info(target: &str) -> Result<ExtractResult, String> {
         return Err("Failed to build Douyu play url".into());
     }
 
-    let mut urls = vec![primary_url];
-    urls.extend(get_backup_urls(play_data));
+    let mut urls = get_backup_urls(play_data);
+    urls.push(primary_url);
     state.title = value_to_string(&play_data["room_name"]);
     if state.title.is_empty() {
         state.title = state.room_name.clone();
@@ -1179,69 +1179,62 @@ fn bilibili_codec_urls(codec: &BilibiliPlayCodec) -> Vec<String> {
         .collect()
 }
 
-fn bilibili_codec_quality(codec: &BilibiliPlayCodec) -> i64 {
-    let current = codec.current_qn;
-    if current > 0 {
-        current
+fn bilibili_cdn_level(url: &str) -> i32 {
+    let Ok(parsed) = Url::parse(url) else {
+        return 2;
+    };
+    let Some(host) = parsed.host_str() else {
+        return 2;
+    };
+
+    if host.contains(".mcdn.bilivideo.cn") {
+        2
+    } else if host.contains(".szbdyd.com") {
+        3
+    } else if host.contains("bilivideo.com") && host.starts_with("up") {
+        0
     } else {
-        codec.accept_qn.iter().copied().max().unwrap_or_default()
+        1
     }
 }
 
-fn bilibili_protocol_rank(protocol_name: &str) -> i32 {
-    match protocol_name {
-        "http_stream" => 2,
-        "http_hls" => 1,
-        _ => 0,
-    }
-}
-
-fn bilibili_format_rank(format_name: &str) -> i32 {
-    match format_name {
-        "flv" => 2,
-        "fmp4" => 1,
-        _ => 0,
-    }
-}
-
-fn bilibili_codec_rank(codec_name: &str) -> i32 {
-    match codec_name {
-        "avc" => 2,
-        "hevc" => 1,
-        _ => 0,
-    }
-}
-
-fn select_bilibili_urls(playurl: &BilibiliPlayurl) -> Vec<String> {
-    let mut best_score = None::<(i64, i32, i32, i32)>;
-    let mut best_urls = Vec::new();
-
-    for stream in &playurl.stream {
-        let protocol_rank = bilibili_protocol_rank(&stream.protocol_name);
-        for format in &stream.formats {
-            let format_rank = bilibili_format_rank(&format.format_name);
-            for codec in &format.codecs {
-                let urls = bilibili_codec_urls(codec);
-                if urls.is_empty() {
-                    continue;
-                }
-
-                let score = (
-                    bilibili_codec_quality(codec),
-                    protocol_rank,
-                    format_rank,
-                    bilibili_codec_rank(&codec.codec_name),
-                );
-
-                if best_score.as_ref().map(|best| score > *best).unwrap_or(true) {
-                    best_score = Some(score);
-                    best_urls = urls;
-                }
-            }
+fn reorder_bilibili_urls(urls: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for url in urls {
+        if !deduped.contains(&url) {
+            deduped.push(url);
         }
     }
 
-    best_urls
+    deduped.sort_by_key(|url| bilibili_cdn_level(url));
+    deduped
+}
+
+fn select_bilibili_codec<'a>(
+    playurl: &'a BilibiliPlayurl,
+    protocol_name: &str,
+    format_name: &str,
+    codec_name: &str,
+) -> Option<&'a BilibiliPlayCodec> {
+    playurl
+        .stream
+        .iter()
+        .find(|stream| stream.protocol_name == protocol_name)?
+        .formats
+        .iter()
+        .find(|format| format.format_name == format_name)?
+        .codecs
+        .iter()
+        .find(|codec| codec.codec_name == codec_name)
+}
+
+fn select_bilibili_urls(playurl: &BilibiliPlayurl) -> Vec<String> {
+    let codec = select_bilibili_codec(playurl, "http_stream", "flv", "avc")
+        .or_else(|| select_bilibili_codec(playurl, "http_hls", "fmp4", "avc"));
+
+    codec
+        .map(|codec| reorder_bilibili_urls(bilibili_codec_urls(codec)))
+        .unwrap_or_default()
 }
 
 fn fetch_bilibili_room_play_info(room_id: &str, qn: i64, raw_cookie: &str) -> Result<Vec<String>, String> {
@@ -1626,6 +1619,27 @@ fn build_iina_plus_args(data: &ExtractResult, media_title: &str, port: u16) -> R
     Ok(encode_hex(&json))
 }
 
+fn build_iina_plugin_url(args_hex: &str, port: u16) -> String {
+    let script_opt_pair = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("mpv_script-opts", &format!("iinaPlusArgs={args_hex}"))
+        .finish();
+    let checker = script_opt_pair
+        .chars()
+        .rev()
+        .take(25)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let video_url = format!("http://127.0.0.1:{port}/video.mp4?{checker}");
+
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("new_window", "1");
+    serializer.append_pair("url", &video_url);
+    serializer.append_pair("mpv_script-opts", &format!("iinaPlusArgs={args_hex}"));
+    format!("iina://open?{}", serializer.finish())
+}
+
 fn detect_iina_cli(settings: &Settings) -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -1946,6 +1960,46 @@ fn restart_iina_if_needed() -> Result<(), String> {
     }
 }
 
+fn open_iina_playlist_cli(
+    iina_cli: &str,
+    playlist_path: &Path,
+    media_title: &str,
+    data: &ExtractResult,
+) -> Result<(), String> {
+    let mut command = Command::new(iina_cli);
+    command.arg("--no-stdin");
+    command.arg("--mpv-pause=no");
+    command.arg("--mpv-force-window=immediate");
+    command.arg("--mpv-ytdl=no");
+    command.arg("--mpv-stream-lavf-o=reconnect_streamed=yes");
+    command.arg(format!("--mpv-force-media-title={media_title}"));
+    if data.platform == PLATFORM_BILIBILI_LIVE {
+        command.arg("--mpv-referrer=https://live.bilibili.com/");
+    }
+    command.arg(playlist_path);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    command.spawn().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn open_iina_plugin_url_scheme(
+    args_hex: &str,
+    danmaku_port: u16,
+) -> Result<(), String> {
+    let url = build_iina_plugin_url(args_hex, danmaku_port);
+    let status = Command::new("open")
+        .arg(&url)
+        .status()
+        .map_err(|err| err.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("通过 IINA URL Scheme 启动失败。".to_string())
+    }
+}
+
 fn open_iina_playlist(
     app: &AppHandle,
     settings: &Settings,
@@ -1965,40 +2019,34 @@ fn open_iina_playlist(
         enable_xjbeta_iina_plugin()?;
     }
 
-    let mut command = Command::new(iina_cli);
-    command.arg("--no-stdin");
-    command.arg("--mpv-pause=no");
-    command.arg("--mpv-force-window=immediate");
-
     if enable_danmaku {
         let danmaku_port = ensure_danmaku_server(app)?;
         let args_hex = build_iina_plus_args(data, media_title, danmaku_port)?;
-        let checker = args_hex
-            .chars()
-            .rev()
-            .take(25)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>();
-        command.arg(format!("--mpv-script-opts=iinaPlusArgs={args_hex}"));
-        command.arg(format!(
-            "http://127.0.0.1:{danmaku_port}/video.mp4?{checker}"
-        ));
-    } else {
-        command.arg("--mpv-ytdl=no");
-        command.arg("--mpv-stream-lavf-o=reconnect_streamed=yes");
-        command.arg(format!("--mpv-force-media-title={media_title}"));
-        if data.platform == PLATFORM_BILIBILI_LIVE {
-            command.arg("--mpv-referrer=https://live.bilibili.com/");
+        if open_iina_plugin_url_scheme(&args_hex, danmaku_port).is_err() {
+            let mut command = Command::new(&iina_cli);
+            command.arg("--no-stdin");
+            command.arg("--mpv-pause=no");
+            command.arg("--mpv-force-window=immediate");
+            command.arg(format!("--mpv-script-opts=iinaPlusArgs={args_hex}"));
+            command.arg(format!(
+                "http://127.0.0.1:{danmaku_port}/video.mp4?{}",
+                args_hex
+                    .chars()
+                    .rev()
+                    .take(25)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            ));
+            command.stdin(Stdio::null());
+            command.stdout(Stdio::null());
+            command.stderr(Stdio::null());
+            command.spawn().map_err(|err| err.to_string())?;
         }
-        command.arg(playlist_path);
+    } else {
+        open_iina_playlist_cli(&iina_cli, playlist_path, media_title, data)?;
     }
-
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
-    command.stderr(Stdio::null());
-    command.spawn().map_err(|err| err.to_string())?;
     bring_iina_to_front(&iina_process_name);
     Ok(())
 }
