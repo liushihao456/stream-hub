@@ -21,10 +21,50 @@ function parseScriptOptions() {
   }, {});
 }
 
-function getRoomID() {
+function decodeHexJson(hex) {
+  if (!hex || !/^[0-9a-f]+$/i.test(hex) || hex.length % 2 !== 0) {
+    return null;
+  }
+
+  try {
+    let text = "";
+    for (let index = 0; index < hex.length; index += 2) {
+      text += String.fromCharCode(Number.parseInt(hex.slice(index, index + 2), 16));
+    }
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function getIinaPlusArgs() {
   const options = parseScriptOptions();
+  return decodeHexJson(options.iinaPlusArgs || "");
+}
+
+function inferPlatform(target) {
+  const value = String(target || "").toLowerCase();
+  if (value.includes("live.bilibili.com")) return "bilibili_live";
+  if (value.includes("huya.com")) return "huya";
+  if (value.includes("live.douyin.com") || value.includes("v.douyin.com")) return "douyin_live";
+  return "douyu";
+}
+
+function extractNumericId(target) {
+  const value = String(target || "").trim();
+  if (/^\d+$/.test(value)) return value;
+  const segment = value.split("#")[0].split("?")[0].replace(/\/+$/, "").split("/").pop() || "";
+  return /^\d+$/.test(segment) ? segment : "";
+}
+
+function getDanmakuTarget() {
+  const options = parseScriptOptions();
+  const args = getIinaPlusArgs();
   if (options.streamhub_target) {
     return options.streamhub_target;
+  }
+  if (args && args.rawUrl) {
+    return args.rawUrl;
   }
 
   const path = mpv.getString("path") || "";
@@ -32,15 +72,25 @@ function getRoomID() {
   return match ? match[1] : "";
 }
 
+function getRoomID() {
+  return extractNumericId(getDanmakuTarget());
+}
+
+function getPlatform() {
+  const options = parseScriptOptions();
+  return options.streamhub_platform || inferPlatform(getDanmakuTarget());
+}
+
 function getDanmakuPort() {
   const options = parseScriptOptions();
-  const raw = Number.parseInt(options.streamhub_port || "19080", 10);
+  const args = getIinaPlusArgs();
+  const raw = Number.parseInt(options.streamhub_port || String(args?.port || "19080"), 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 19080;
 }
 
 function isDanmakuEnabled() {
   const options = parseScriptOptions();
-  return (options.streamhub_enabled || "").toLowerCase() === "yes";
+  return Boolean(getIinaPlusArgs()) || (options.streamhub_enabled || "").toLowerCase() === "yes";
 }
 
 function syncOverlay() {
@@ -58,7 +108,7 @@ function syncOverlay() {
 
   overlay.show();
   if (overlayReady) {
-    overlay.postMessage("configure", { roomID: currentRoomID, port: currentPort });
+    overlay.postMessage("configure", { roomID: currentRoomID, platform: getPlatform(), port: currentPort });
   }
 }
 

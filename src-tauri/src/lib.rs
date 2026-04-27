@@ -6,7 +6,8 @@ use axum::routing::get;
 use axum::Router;
 use base64::Engine;
 use block2::RcBlock;
-use futures_util::StreamExt;
+use flate2::read::GzDecoder;
+use futures_util::{SinkExt, StreamExt};
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, ORIGIN, REFERER, USER_AGENT};
@@ -15,17 +16,22 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::ptr::NonNull;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command as TokioCommand;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue as WsHeaderValue;
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use url::Url;
 use uuid::Uuid;
 
@@ -414,7 +420,11 @@ struct HuyaLiveData {
     avatar_180: String,
     #[serde(default)]
     screenshot: String,
-    #[serde(default, rename = "profileRoom", deserialize_with = "deserialize_value_to_string")]
+    #[serde(
+        default,
+        rename = "profileRoom",
+        deserialize_with = "deserialize_value_to_string"
+    )]
     profile_room: String,
 }
 
@@ -451,6 +461,22 @@ struct DouyinHelperResponse {
     urls: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct DouyinDanmakuResponse {
+    cookie: String,
+    user_agent: String,
+    referer: String,
+    ws_url: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DouyinDanmakuBatch {
+    comments: Vec<String>,
+    need_ack: bool,
+    ack_payload: Vec<u8>,
+    log_id: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IinaPlusArgs {
@@ -478,6 +504,7 @@ struct DanmakuHttpState {
     dummy_media: Arc<Vec<u8>>,
     node_bin: String,
     bridge_script: PathBuf,
+    douyin_helper_script: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -599,7 +626,10 @@ fn extract_bilibili_room_id(target: &str) -> Option<String> {
     }
 
     let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
-    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
     let segment = without_query
         .trim_end_matches('/')
         .rsplit('/')
@@ -620,7 +650,10 @@ fn extract_huya_room_id(target: &str) -> Option<String> {
     }
 
     let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
-    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
     let segment = without_query
         .trim_end_matches('/')
         .rsplit('/')
@@ -641,7 +674,10 @@ fn extract_douyin_room_id(target: &str) -> Option<String> {
     }
 
     let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
-    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
     let segments = without_query
         .trim_end_matches('/')
         .split('/')
@@ -656,7 +692,6 @@ fn extract_douyin_room_id(target: &str) -> Option<String> {
 
     None
 }
-
 
 fn danmaku_text_event(text: impl Into<String>) -> Result<String, String> {
     let event = DanmakuEventPayload {
@@ -694,7 +729,10 @@ fn extract_room_id_from_target(input: &str) -> Option<String> {
     }
 
     let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
-    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
     let segment = without_query
         .trim_end_matches('/')
         .rsplit('/')
@@ -716,7 +754,10 @@ fn fetch_text(url: &str, referer: Option<&str>) -> Result<String, String> {
         HeaderValue::from_str(DOUYU_USER_AGENT).map_err(|err| err.to_string())?,
     );
     if let Some(value) = referer {
-        headers.insert(REFERER, HeaderValue::from_str(value).map_err(|err| err.to_string())?);
+        headers.insert(
+            REFERER,
+            HeaderValue::from_str(value).map_err(|err| err.to_string())?,
+        );
     }
 
     let response = client
@@ -745,10 +786,16 @@ fn fetch_text_with_headers(
         HeaderValue::from_str(user_agent).map_err(|err| err.to_string())?,
     );
     if let Some(value) = referer {
-        headers.insert(REFERER, HeaderValue::from_str(value).map_err(|err| err.to_string())?);
+        headers.insert(
+            REFERER,
+            HeaderValue::from_str(value).map_err(|err| err.to_string())?,
+        );
     }
     if let Some(value) = origin {
-        headers.insert(ORIGIN, HeaderValue::from_str(value).map_err(|err| err.to_string())?);
+        headers.insert(
+            ORIGIN,
+            HeaderValue::from_str(value).map_err(|err| err.to_string())?,
+        );
     }
 
     let response = client
@@ -833,8 +880,14 @@ fn fetch_bilibili_json(url: &str, referer: &str, raw_cookie: &str) -> Result<Val
         USER_AGENT,
         HeaderValue::from_str(BILIBILI_USER_AGENT).map_err(|err| err.to_string())?,
     );
-    headers.insert(REFERER, HeaderValue::from_str(referer).map_err(|err| err.to_string())?);
-    headers.insert(ORIGIN, HeaderValue::from_static("https://live.bilibili.com"));
+    headers.insert(
+        REFERER,
+        HeaderValue::from_str(referer).map_err(|err| err.to_string())?,
+    );
+    headers.insert(
+        ORIGIN,
+        HeaderValue::from_static("https://live.bilibili.com"),
+    );
     if let Some(cookie_header) = build_bilibili_cookie_header(raw_cookie)? {
         headers.insert(reqwest::header::COOKIE, cookie_header);
     }
@@ -888,7 +941,10 @@ fn fetch_bilibili_search(keyword: &str) -> Result<Vec<BilibiliLiveSearchItem>, S
         USER_AGENT,
         HeaderValue::from_str(BILIBILI_USER_AGENT).map_err(|err| err.to_string())?,
     );
-    headers.insert(REFERER, HeaderValue::from_static("https://www.bilibili.com/"));
+    headers.insert(
+        REFERER,
+        HeaderValue::from_static("https://www.bilibili.com/"),
+    );
     let _ = client
         .get("https://www.bilibili.com")
         .headers(headers.clone())
@@ -918,11 +974,11 @@ fn post_form_json(url: &str, referer: &str, body: &[(String, String)]) -> Result
         USER_AGENT,
         HeaderValue::from_str(DOUYU_USER_AGENT).map_err(|err| err.to_string())?,
     );
-    headers.insert(REFERER, HeaderValue::from_str(referer).map_err(|err| err.to_string())?);
     headers.insert(
-        ORIGIN,
-        HeaderValue::from_static("https://www.douyu.com"),
+        REFERER,
+        HeaderValue::from_str(referer).map_err(|err| err.to_string())?,
     );
+    headers.insert(ORIGIN, HeaderValue::from_static("https://www.douyu.com"));
     headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_static("application/x-www-form-urlencoded; charset=UTF-8"),
@@ -977,13 +1033,13 @@ fn value_to_string(value: &Value) -> String {
 }
 
 fn extract_room_info(html: &str) -> Result<RoomInfo, String> {
-    let room_info_json =
-        extract_room_info_json(html).ok_or_else(|| "Failed to extract roomInfo JSON".to_string())?;
+    let room_info_json = extract_room_info_json(html)
+        .ok_or_else(|| "Failed to extract roomInfo JSON".to_string())?;
     let parsed: Value = serde_json::from_str(&room_info_json).map_err(|err| err.to_string())?;
     let room = &parsed["room"];
     let room_id = value_to_string(&room["room_id"]);
     if room_id.trim().is_empty() {
-      return Err("Failed to find room_id in roomInfo JSON".into());
+        return Err("Failed to find room_id in roomInfo JSON".into());
     }
 
     let avatar_big = value_to_string(&room["avatar"]["big"]);
@@ -994,7 +1050,11 @@ fn extract_room_info(html: &str) -> Result<RoomInfo, String> {
         is_living: is_room_online(room),
         streamer_name: value_to_string(&room["nickname"]),
         room_name: value_to_string(&room["room_name"]),
-        avatar_url: if avatar_big.is_empty() { avatar_mid } else { avatar_big },
+        avatar_url: if avatar_big.is_empty() {
+            avatar_mid
+        } else {
+            avatar_big
+        },
     })
 }
 
@@ -1034,7 +1094,11 @@ fn get_room_snapshot(room_id: &str) -> Result<RoomSnapshot, String> {
         room_id: room_id.to_string(),
         streamer_name: value_to_string(&room["nickname"]),
         room_name: value_to_string(&room["room_name"]),
-        avatar_url: if avatar_big.is_empty() { avatar_mid } else { avatar_big },
+        avatar_url: if avatar_big.is_empty() {
+            avatar_mid
+        } else {
+            avatar_big
+        },
         is_online: is_room_online(room),
         screenshot_url: if is_room_online(room) {
             value_to_string(&room["room_pic"])
@@ -1113,9 +1177,7 @@ fn fetch_douyu_room_state(target: &str) -> Result<ExtractResult, String> {
 }
 
 fn get_encryption(did: &str) -> Result<Value, String> {
-    let url = format!(
-        "https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did={did}"
-    );
+    let url = format!("https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did={did}");
     let json = fetch_json(&url, None)?;
     if json["error"].as_i64().unwrap_or(-1) != 0 {
         return Err(format!(
@@ -1166,7 +1228,11 @@ fn build_xs_info(play_data: &Value) -> Option<(String, String)> {
         return None;
     }
 
-    let mut xs_parts: Vec<String> = rtmp_live.replace("flv", "xs").split('&').map(str::to_string).collect();
+    let mut xs_parts: Vec<String> = rtmp_live
+        .replace("flv", "xs")
+        .split('&')
+        .map(str::to_string)
+        .collect();
     xs_parts.push(format!("delay={delay}"));
     xs_parts.push(format!("txSecret={tx_secret}"));
     xs_parts.push(format!("txTime={tx_time}"));
@@ -1284,7 +1350,8 @@ fn resolve_huya_room_id(target: &str) -> Result<String, String> {
         return Ok(room_id);
     }
 
-    let page_url = if target.trim().starts_with("http://") || target.trim().starts_with("https://") {
+    let page_url = if target.trim().starts_with("http://") || target.trim().starts_with("https://")
+    {
         target.trim().to_string()
     } else {
         format!("https://www.huya.com/{}", target.trim())
@@ -1372,7 +1439,9 @@ fn huya_rot_uid(uid: u64) -> Option<u64> {
 }
 
 fn huya_decode_base64_to_string(value: &str) -> Option<String> {
-    let decoded = base64::engine::general_purpose::STANDARD.decode(value).ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .ok()?;
     String::from_utf8(decoded).ok()
 }
 
@@ -1393,7 +1462,10 @@ fn huya_ws_secret(
     let fm = anti_codes.get("fm")?;
     let ws_time = anti_codes.get("wsTime")?;
     let ctype = anti_codes.get("ctype")?;
-    let t = anti_codes.get("t").cloned().unwrap_or_else(|| "100".to_string());
+    let t = anti_codes
+        .get("t")
+        .cloned()
+        .unwrap_or_else(|| "100".to_string());
     let mut template = huya_decode_base64_to_string(&urlencoding::decode(fm).ok()?.to_string())?;
     let suffix = md5_hex(&format!("{seq_id}|{ctype}|{t}"));
     template = template.replace("$0", &converted_uid.to_string());
@@ -1437,7 +1509,13 @@ fn huya_format_url(uid: u64, stream: &HuyaStreamInfo) -> Option<String> {
 
     let query = example_query
         .into_iter()
-        .filter_map(|(key, value)| anti_codes.get(&key).cloned().or(Some(value)).map(|final_value| format!("{key}={final_value}")))
+        .filter_map(|(key, value)| {
+            anti_codes
+                .get(&key)
+                .cloned()
+                .or(Some(value))
+                .map(|final_value| format!("{key}={final_value}"))
+        })
         .collect::<Vec<_>>()
         .join("&");
 
@@ -1485,10 +1563,9 @@ fn extract_huya_play_info(target: &str) -> Result<ExtractResult, String> {
 }
 
 fn get_bilibili_room_info(target: &str, raw_cookie: &str) -> Result<BilibiliRoomInfoData, String> {
-    let room_id = extract_bilibili_room_id(target).ok_or_else(|| "无法识别 B 站直播间房间号".to_string())?;
-    let url = format!(
-        "https://api.live.bilibili.com/room/v1/Room/get_info?room_id={room_id}"
-    );
+    let room_id =
+        extract_bilibili_room_id(target).ok_or_else(|| "无法识别 B 站直播间房间号".to_string())?;
+    let url = format!("https://api.live.bilibili.com/room/v1/Room/get_info?room_id={room_id}");
     let response: BilibiliRoomInfoResponse = serde_json::from_value(fetch_bilibili_json(
         &url,
         &build_bilibili_live_url(&room_id),
@@ -1591,7 +1668,8 @@ fn fetch_bilibili_room_state(target: &str, raw_cookie: &str) -> Result<ExtractRe
 }
 
 fn bilibili_codec_urls(codec: &BilibiliPlayCodec) -> Vec<String> {
-    codec.url_info
+    codec
+        .url_info
         .iter()
         .filter(|info| !info.host.trim().is_empty())
         .map(|info| format!("{}{}{}", info.host, codec.base_url, info.extra))
@@ -1656,7 +1734,11 @@ fn select_bilibili_urls(playurl: &BilibiliPlayurl) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn fetch_bilibili_room_play_info(room_id: &str, qn: i64, raw_cookie: &str) -> Result<Vec<String>, String> {
+fn fetch_bilibili_room_play_info(
+    room_id: &str,
+    qn: i64,
+    raw_cookie: &str,
+) -> Result<Vec<String>, String> {
     let url = format!(
         "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id={room_id}&protocol=0,1&format=0,1,2&codec=0,1&qn={qn}&platform=web&ptype=8&dolby=5"
     );
@@ -1678,7 +1760,11 @@ fn fetch_bilibili_room_play_info(room_id: &str, qn: i64, raw_cookie: &str) -> Re
     Ok(urls)
 }
 
-fn fetch_bilibili_old_play_url(room_id: &str, qn: i64, raw_cookie: &str) -> Result<Vec<String>, String> {
+fn fetch_bilibili_old_play_url(
+    room_id: &str,
+    qn: i64,
+    raw_cookie: &str,
+) -> Result<Vec<String>, String> {
     let url = format!(
         "https://api.live.bilibili.com/room/v1/Room/playUrl?cid={room_id}&qn={qn}&platform=web"
     );
@@ -1692,7 +1778,13 @@ fn fetch_bilibili_old_play_url(room_id: &str, qn: i64, raw_cookie: &str) -> Resu
         .data
         .durl
         .into_iter()
-        .filter_map(|item| if item.url.trim().is_empty() { None } else { Some(item.url) })
+        .filter_map(|item| {
+            if item.url.trim().is_empty() {
+                None
+            } else {
+                Some(item.url)
+            }
+        })
         .collect::<Vec<_>>();
     if urls.is_empty() {
         return Err("未获取到 B 站旧版播放线路".to_string());
@@ -1716,7 +1808,10 @@ fn fetch_bilibili_html_play_url(room_id: &str, raw_cookie: &str) -> Result<Vec<S
             USER_AGENT,
             HeaderValue::from_str(BILIBILI_USER_AGENT).map_err(|err| err.to_string())?,
         );
-        headers.insert(REFERER, HeaderValue::from_str(&room_url).map_err(|err| err.to_string())?);
+        headers.insert(
+            REFERER,
+            HeaderValue::from_str(&room_url).map_err(|err| err.to_string())?,
+        );
         if let Some(cookie_header) = build_bilibili_cookie_header(raw_cookie)? {
             headers.insert(reqwest::header::COOKIE, cookie_header);
         }
@@ -1729,11 +1824,16 @@ fn fetch_bilibili_html_play_url(room_id: &str, raw_cookie: &str) -> Result<Vec<S
             .map_err(|err| err.to_string())?
     };
 
-    let json_text = extract_json_from_script(&html, "<script>window.__NEPTUNE_IS_MY_WAIFU__=", "</script>")
-        .ok_or_else(|| "未找到 B 站直播页面初始化数据".to_string())?;
+    let json_text = extract_json_from_script(
+        &html,
+        "<script>window.__NEPTUNE_IS_MY_WAIFU__=",
+        "</script>",
+    )
+    .ok_or_else(|| "未找到 B 站直播页面初始化数据".to_string())?;
     let json: Value = serde_json::from_str(&json_text).map_err(|err| err.to_string())?;
     let playurl = &json["roomInitRes"]["data"]["playurl_info"]["playurl"];
-    let playurl: BilibiliPlayurl = serde_json::from_value(playurl.clone()).map_err(|err| err.to_string())?;
+    let playurl: BilibiliPlayurl =
+        serde_json::from_value(playurl.clone()).map_err(|err| err.to_string())?;
     let urls = select_bilibili_urls(&playurl);
     if urls.is_empty() {
         return Err("未从 B 站页面解析到播放线路".to_string());
@@ -1761,8 +1861,14 @@ fn extract_bilibili_play_info(target: &str, raw_cookie: &str) -> Result<ExtractR
 fn build_douyin_search_engine_urls(keyword: &str) -> Vec<String> {
     let encoded = urlencoding::encode(keyword);
     vec![
-        format!("https://www.so.com/s?q={}", urlencoding::encode(&format!("site:live.douyin.com {keyword} 抖音 直播"))),
-        format!("https://www.sogou.com/web?query={}", urlencoding::encode(&format!("site:live.douyin.com {keyword} 抖音 直播"))),
+        format!(
+            "https://www.so.com/s?q={}",
+            urlencoding::encode(&format!("site:live.douyin.com {keyword} 抖音 直播"))
+        ),
+        format!(
+            "https://www.sogou.com/web?query={}",
+            urlencoding::encode(&format!("site:live.douyin.com {keyword} 抖音 直播"))
+        ),
         format!("https://www.sogou.com/web?query={encoded}%20抖音%20直播"),
     ]
 }
@@ -1823,7 +1929,8 @@ fn fetch_douyin_room_state_with_app(
     app: Option<&AppHandle>,
     target: &str,
 ) -> Result<ExtractResult, String> {
-    let room_id = extract_douyin_room_id(target).ok_or_else(|| "无法识别抖音直播间房间号".to_string())?;
+    let room_id =
+        extract_douyin_room_id(target).ok_or_else(|| "无法识别抖音直播间房间号".to_string())?;
     let response = run_douyin_helper(app, &room_id)?;
     Ok(ExtractResult {
         platform: PLATFORM_DOUYIN_LIVE.to_string(),
@@ -1971,10 +2078,7 @@ fn extract_bilibili_cookie_from_window<R: tauri::Runtime>(
     Ok(None)
 }
 
-fn save_bilibili_cookie_and_notify(
-    app: &AppHandle,
-    cookie: String,
-) -> Result<Settings, String> {
+fn save_bilibili_cookie_and_notify(app: &AppHandle, cookie: String) -> Result<Settings, String> {
     let mut settings = load_settings_inner(app)?;
     settings.bilibili_cookie = cookie;
     save_settings_inner(app, &settings)?;
@@ -1992,10 +2096,7 @@ fn clear_bilibili_cookie_and_notify(app: &AppHandle) -> Result<Settings, String>
     Ok(settings)
 }
 
-fn maybe_capture_bilibili_login<R: tauri::Runtime>(
-    app: AppHandle,
-    window: WebviewWindow<R>,
-) {
+fn maybe_capture_bilibili_login<R: tauri::Runtime>(app: AppHandle, window: WebviewWindow<R>) {
     match extract_bilibili_cookie_from_window(&window) {
         Ok(Some(cookie)) => {
             if save_bilibili_cookie_and_notify(&app, cookie).is_ok() {
@@ -2143,7 +2244,11 @@ fn encode_hex(data: &[u8]) -> String {
     data.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn build_iina_plus_args(data: &ExtractResult, media_title: &str, port: u16) -> Result<String, String> {
+fn build_iina_plus_args(
+    data: &ExtractResult,
+    media_title: &str,
+    port: u16,
+) -> Result<String, String> {
     let payload = IinaPlusArgs {
         raw_url: data.page_url.clone(),
         mpv_script: build_mpv_script_opts(data, media_title),
@@ -2264,8 +2369,8 @@ fn iina_plugin_root() -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
         let home = env::var("HOME").map_err(|err| err.to_string())?;
-        let path = PathBuf::from(home)
-            .join("Library/Application Support/com.colliderli.iina/plugins");
+        let path =
+            PathBuf::from(home).join("Library/Application Support/com.colliderli.iina/plugins");
         fs::create_dir_all(&path).map_err(|err| err.to_string())?;
         Ok(path)
     }
@@ -2301,16 +2406,15 @@ fn xjbeta_iina_plugin_dir() -> Result<PathBuf, String> {
     if plugin_dir.exists() {
         Ok(plugin_dir)
     } else {
-        Err("未检测到 IINA 弹幕插件 com.xjbeta.danmaku，请先安装 iina-plus 的弹幕插件。".to_string())
+        Err(
+            "未检测到 IINA 弹幕插件 com.xjbeta.danmaku，请先安装 iina-plus 的弹幕插件。"
+                .to_string(),
+        )
     }
 }
 
 fn detect_node_binary() -> Result<String, String> {
-    let candidates = [
-        "node",
-        "/opt/homebrew/bin/node",
-        "/usr/local/bin/node",
-    ];
+    let candidates = ["node", "/opt/homebrew/bin/node", "/usr/local/bin/node"];
 
     for candidate in candidates {
         let mut cmd = Command::new(candidate);
@@ -2322,7 +2426,7 @@ fn detect_node_binary() -> Result<String, String> {
         }
     }
 
-    Err("未找到可用的 Node.js，斗鱼弹幕桥接无法启动。".to_string())
+    Err("未找到可用的 Node.js，弹幕桥接无法启动。".to_string())
 }
 
 fn locate_danmaku_bridge_script(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2332,7 +2436,8 @@ fn locate_danmaku_bridge_script(app: &AppHandle) -> Result<PathBuf, String> {
         candidates.push(resource_dir.join("douyu_danmaku_bridge.js"));
     }
 
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/douyu_danmaku_bridge.js"));
+    candidates
+        .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/douyu_danmaku_bridge.js"));
 
     if let Ok(current_dir) = env::current_dir() {
         candidates.push(current_dir.join("src-tauri/resources/douyu_danmaku_bridge.js"));
@@ -2342,7 +2447,7 @@ fn locate_danmaku_bridge_script(app: &AppHandle) -> Result<PathBuf, String> {
     candidates
         .into_iter()
         .find(|path| path.exists() && path.is_file())
-        .ok_or_else(|| "未找到斗鱼弹幕桥接脚本。".to_string())
+        .ok_or_else(|| "未找到弹幕桥接脚本。".to_string())
 }
 
 fn locate_resource_file(app: &AppHandle, file_name: &str) -> Result<PathBuf, String> {
@@ -2353,7 +2458,11 @@ fn locate_resource_file(app: &AppHandle, file_name: &str) -> Result<PathBuf, Str
         candidates.push(resource_dir.join(file_name));
     }
 
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join(file_name));
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(file_name),
+    );
 
     if let Ok(current_dir) = env::current_dir() {
         candidates.push(current_dir.join("src-tauri/resources").join(file_name));
@@ -2386,7 +2495,9 @@ fn run_douyin_helper(
         locate_douyin_helper_script(app)?
     } else {
         let mut candidates = Vec::new();
-        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/douyin_live_helper.js"));
+        candidates.push(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/douyin_live_helper.js"),
+        );
         if let Ok(current_dir) = env::current_dir() {
             candidates.push(current_dir.join("src-tauri/resources/douyin_live_helper.js"));
             candidates.push(current_dir.join("resources/douyin_live_helper.js"));
@@ -2414,6 +2525,227 @@ fn run_douyin_helper(
 
     let stdout = String::from_utf8(output.stdout).map_err(|err| err.to_string())?;
     serde_json::from_str(stdout.trim()).map_err(|err| err.to_string())
+}
+
+async fn prepare_douyin_danmaku(
+    state: &DanmakuHttpState,
+    room_id: &str,
+) -> Result<DouyinDanmakuResponse, String> {
+    let output = TokioCommand::new(&state.node_bin)
+        .arg(&state.douyin_helper_script)
+        .arg("--danmaku")
+        .arg(room_id)
+        .output()
+        .await
+        .map_err(|err| err.to_string())?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "抖音弹幕签名失败".to_string()
+        } else {
+            stderr
+        });
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|err| err.to_string())?;
+    serde_json::from_str(stdout.trim()).map_err(|err| err.to_string())
+}
+
+fn read_proto_varint(data: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let mut result = 0u64;
+    let mut shift = 0u32;
+    while *cursor < data.len() {
+        let byte = data[*cursor];
+        *cursor += 1;
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err("protobuf varint 过长".to_string());
+        }
+    }
+    Err("protobuf varint 不完整".to_string())
+}
+
+fn read_proto_bytes<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], String> {
+    let length = read_proto_varint(data, cursor)? as usize;
+    if *cursor + length > data.len() {
+        return Err("protobuf bytes 不完整".to_string());
+    }
+    let bytes = &data[*cursor..*cursor + length];
+    *cursor += length;
+    Ok(bytes)
+}
+
+fn skip_proto_field(data: &[u8], cursor: &mut usize, wire_type: u64) -> Result<(), String> {
+    match wire_type {
+        0 => {
+            let _ = read_proto_varint(data, cursor)?;
+        }
+        1 => {
+            if *cursor + 8 > data.len() {
+                return Err("protobuf fixed64 不完整".to_string());
+            }
+            *cursor += 8;
+        }
+        2 => {
+            let _ = read_proto_bytes(data, cursor)?;
+        }
+        5 => {
+            if *cursor + 4 > data.len() {
+                return Err("protobuf fixed32 不完整".to_string());
+            }
+            *cursor += 4;
+        }
+        _ => return Err(format!("不支持的 protobuf wire type: {wire_type}")),
+    }
+    Ok(())
+}
+
+fn decode_proto_string(bytes: &[u8]) -> String {
+    String::from_utf8(bytes.to_vec()).unwrap_or_default()
+}
+
+fn decode_douyin_outer_frame(data: &[u8]) -> Result<(u64, Vec<u8>), String> {
+    let mut cursor = 0usize;
+    let mut log_id = 0u64;
+    let mut payload = Vec::new();
+
+    while cursor < data.len() {
+        let key = read_proto_varint(data, &mut cursor)?;
+        let field = key >> 3;
+        let wire_type = key & 0x07;
+        match (field, wire_type) {
+            (3, 0) => log_id = read_proto_varint(data, &mut cursor)?,
+            (8, 2) => payload = read_proto_bytes(data, &mut cursor)?.to_vec(),
+            _ => skip_proto_field(data, &mut cursor, wire_type)?,
+        }
+    }
+
+    Ok((log_id, payload))
+}
+
+fn decode_douyin_message(data: &[u8]) -> Result<(String, Vec<u8>), String> {
+    let mut cursor = 0usize;
+    let mut method = String::new();
+    let mut payload = Vec::new();
+
+    while cursor < data.len() {
+        let key = read_proto_varint(data, &mut cursor)?;
+        let field = key >> 3;
+        let wire_type = key & 0x07;
+        match (field, wire_type) {
+            (1, 2) => method = decode_proto_string(read_proto_bytes(data, &mut cursor)?),
+            (2, 2) => payload = read_proto_bytes(data, &mut cursor)?.to_vec(),
+            _ => skip_proto_field(data, &mut cursor, wire_type)?,
+        }
+    }
+
+    Ok((method, payload))
+}
+
+fn decode_douyin_chat_content(data: &[u8]) -> Result<String, String> {
+    let mut cursor = 0usize;
+
+    while cursor < data.len() {
+        let key = read_proto_varint(data, &mut cursor)?;
+        let field = key >> 3;
+        let wire_type = key & 0x07;
+        match (field, wire_type) {
+            (3, 2) => return Ok(decode_proto_string(read_proto_bytes(data, &mut cursor)?)),
+            _ => skip_proto_field(data, &mut cursor, wire_type)?,
+        }
+    }
+
+    Ok(String::new())
+}
+
+fn decode_douyin_response(data: &[u8], log_id: u64) -> Result<DouyinDanmakuBatch, String> {
+    let mut cursor = 0usize;
+    let mut comments = Vec::new();
+    let mut internal_ext = String::new();
+    let mut need_ack = false;
+
+    while cursor < data.len() {
+        let key = read_proto_varint(data, &mut cursor)?;
+        let field = key >> 3;
+        let wire_type = key & 0x07;
+        match (field, wire_type) {
+            (1, 2) => {
+                let (method, payload) =
+                    decode_douyin_message(read_proto_bytes(data, &mut cursor)?)?;
+                if method == "WebcastChatMessage" {
+                    let text = decode_douyin_chat_content(&payload)?.trim().to_string();
+                    if !text.is_empty() {
+                        comments.push(text);
+                    }
+                }
+            }
+            (5, 2) => internal_ext = decode_proto_string(read_proto_bytes(data, &mut cursor)?),
+            (9, 0) => need_ack = read_proto_varint(data, &mut cursor)? != 0,
+            _ => skip_proto_field(data, &mut cursor, wire_type)?,
+        }
+    }
+
+    Ok(DouyinDanmakuBatch {
+        comments,
+        need_ack,
+        ack_payload: internal_ext.into_bytes(),
+        log_id,
+    })
+}
+
+fn decode_douyin_danmaku_batch(data: &[u8]) -> Result<DouyinDanmakuBatch, String> {
+    let (log_id, payload) = decode_douyin_outer_frame(data)?;
+    if payload.is_empty() {
+        return Ok(DouyinDanmakuBatch::default());
+    }
+
+    let mut decoder = GzDecoder::new(payload.as_slice());
+    let mut decoded = Vec::new();
+    if decoder.read_to_end(&mut decoded).is_err() {
+        decoded = payload;
+    }
+
+    decode_douyin_response(&decoded, log_id)
+}
+
+fn write_proto_varint(mut value: u64, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn write_proto_bytes_field(field: u64, bytes: &[u8], output: &mut Vec<u8>) {
+    write_proto_varint((field << 3) | 2, output);
+    write_proto_varint(bytes.len() as u64, output);
+    output.extend_from_slice(bytes);
+}
+
+fn write_proto_string_field(field: u64, value: &str, output: &mut Vec<u8>) {
+    write_proto_bytes_field(field, value.as_bytes(), output);
+}
+
+fn write_proto_varint_field(field: u64, value: u64, output: &mut Vec<u8>) {
+    write_proto_varint(field << 3, output);
+    write_proto_varint(value, output);
+}
+
+fn encode_douyin_push_frame(payload_type: &str, log_id: u64, payload: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    if log_id > 0 {
+        write_proto_varint_field(2, log_id, &mut output);
+    }
+    write_proto_string_field(7, payload_type, &mut output);
+    if !payload.is_empty() {
+        write_proto_bytes_field(8, payload, &mut output);
+    }
+    output
 }
 
 fn enable_xjbeta_iina_plugin() -> Result<(), String> {
@@ -2578,10 +2910,7 @@ fn open_iina_playlist_cli(
     Ok(())
 }
 
-fn open_iina_plugin_url_scheme(
-    args_hex: &str,
-    danmaku_port: u16,
-) -> Result<(), String> {
+fn open_iina_plugin_url_scheme(args_hex: &str, danmaku_port: u16) -> Result<(), String> {
     let url = build_iina_plugin_url(args_hex, danmaku_port);
     let status = Command::new("open")
         .arg(&url)
@@ -2606,7 +2935,7 @@ fn open_iina_playlist(
     let enable_danmaku = settings.enable_iina_danmaku
         && matches!(
             data.platform.as_str(),
-            PLATFORM_DOUYU | PLATFORM_BILIBILI_LIVE
+            PLATFORM_DOUYU | PLATFORM_BILIBILI_LIVE | PLATFORM_HUYA | PLATFORM_DOUYIN_LIVE
         );
     if enable_danmaku {
         enable_iina_plugin_system()?;
@@ -2684,6 +3013,7 @@ fn ensure_danmaku_server(app: &AppHandle) -> Result<u16, String> {
         dummy_media: Arc::new(EMPTY_M4A_BYTES.to_vec()),
         node_bin: detect_node_binary()?,
         bridge_script: locate_danmaku_bridge_script(app)?,
+        douyin_helper_script: locate_douyin_helper_script(app)?,
     };
     let state_ref = Arc::clone(&state.inner().clone());
     tauri::async_runtime::spawn(async move {
@@ -2705,9 +3035,7 @@ async fn run_danmaku_server(listener: TcpListener, state: DanmakuHttpState) {
     let _ = axum::serve(listener, app).await;
 }
 
-async fn handle_dummy_video(
-    State(state): State<DanmakuHttpState>,
-) -> impl IntoResponse {
+async fn handle_dummy_video(State(state): State<DanmakuHttpState>) -> impl IntoResponse {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("content-type", AxumHeaderValue::from_static("audio/mp4"));
     headers.insert("cache-control", AxumHeaderValue::from_static("no-store"));
@@ -2750,12 +3078,103 @@ fn parse_danmaku_target_from_client_message(message: &str) -> Option<(String, St
     };
 
     let platform = infer_platform_from_target(payload).to_string();
-    let room_id = if platform == PLATFORM_BILIBILI_LIVE {
-        extract_bilibili_room_id(payload)
-    } else {
-        extract_room_id_from_target(payload)
+    let room_id = match platform.as_str() {
+        PLATFORM_BILIBILI_LIVE => extract_bilibili_room_id(payload),
+        PLATFORM_HUYA => extract_huya_room_id(payload),
+        PLATFORM_DOUYIN_LIVE => extract_douyin_room_id(payload),
+        _ => extract_room_id_from_target(payload),
     }?;
     Some((platform, room_id))
+}
+
+async fn proxy_douyin_danmaku(
+    mut client_stream: WebSocket,
+    room_id: String,
+    state: DanmakuHttpState,
+) -> Result<(), String> {
+    let session = prepare_douyin_danmaku(&state, &room_id).await?;
+    if session.ws_url.trim().is_empty() {
+        return Err("抖音弹幕 WebSocket 地址为空".to_string());
+    }
+
+    let mut request = session
+        .ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|err| err.to_string())?;
+    request.headers_mut().insert(
+        "Cookie",
+        WsHeaderValue::from_str(&session.cookie).map_err(|err| err.to_string())?,
+    );
+    request.headers_mut().insert(
+        "User-Agent",
+        WsHeaderValue::from_str(&session.user_agent).map_err(|err| err.to_string())?,
+    );
+    request.headers_mut().insert(
+        "referer",
+        WsHeaderValue::from_str(if session.referer.trim().is_empty() {
+            "https://live.douyin.com"
+        } else {
+            session.referer.trim()
+        })
+        .map_err(|err| err.to_string())?,
+    );
+
+    let (ws_stream, _) = connect_async(request)
+        .await
+        .map_err(|err| err.to_string())?;
+    let (mut write, mut read) = ws_stream.split();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+
+    client_stream
+        .send(AxumMessage::Text(danmaku_text_event(
+            "Stream Hub 弹幕已连接",
+        )?))
+        .await
+        .map_err(|err| err.to_string())?;
+
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                let payload = encode_douyin_push_frame("hb", 0, &[]);
+                if write.send(TungsteniteMessage::Ping(payload)).await.is_err() {
+                    break;
+                }
+            }
+            message = read.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                match message.map_err(|err| err.to_string())? {
+                    TungsteniteMessage::Binary(data) => {
+                        let batch = decode_douyin_danmaku_batch(&data)?;
+                        for text in batch.comments {
+                            if client_stream
+                                .send(AxumMessage::Text(danmaku_text_event(text)?))
+                                .await
+                                .is_err()
+                            {
+                                let _ = write.close().await;
+                                return Ok(());
+                            }
+                        }
+
+                        if batch.need_ack {
+                            let ack = encode_douyin_push_frame("ack", batch.log_id, &batch.ack_payload);
+                            let _ = write.send(TungsteniteMessage::Binary(ack)).await;
+                        }
+                    }
+                    TungsteniteMessage::Ping(payload) => {
+                        let _ = write.send(TungsteniteMessage::Pong(payload)).await;
+                    }
+                    TungsteniteMessage::Close(_) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn proxy_live_danmaku(
@@ -2765,9 +3184,9 @@ async fn proxy_live_danmaku(
     state: DanmakuHttpState,
 ) -> Result<(), String> {
     client_stream
-        .send(AxumMessage::Text(
-            danmaku_text_event("Stream Hub 本地弹幕服务已连接")?,
-        ))
+        .send(AxumMessage::Text(danmaku_text_event(
+            "Stream Hub 本地弹幕服务已连接",
+        )?))
         .await
         .map_err(|err| err.to_string())?;
 
@@ -2782,7 +3201,9 @@ async fn proxy_live_danmaku(
         while let Some(Ok(message)) = client_stream.next().await {
             match message {
                 AxumMessage::Text(text) => {
-                    if let Some((platform, room_id)) = parse_danmaku_target_from_client_message(&text) {
+                    if let Some((platform, room_id)) =
+                        parse_danmaku_target_from_client_message(&text)
+                    {
                         parsed_platform = platform;
                         parsed_room_id = room_id;
                         break;
@@ -2797,11 +3218,15 @@ async fn proxy_live_danmaku(
 
     if room_id.is_empty() {
         let _ = client_stream
-            .send(AxumMessage::Text(
-                danmaku_text_event("Stream Hub 未能解析房间号")?,
-            ))
+            .send(AxumMessage::Text(danmaku_text_event(
+                "Stream Hub 未能解析房间号",
+            )?))
             .await;
         return Err("无法确定弹幕房间号".to_string());
+    }
+
+    if platform == PLATFORM_DOUYIN_LIVE {
+        return proxy_douyin_danmaku(client_stream, room_id, state).await;
     }
 
     let mut child = TokioCommand::new(&state.node_bin)
@@ -2833,7 +3258,11 @@ async fn proxy_live_danmaku(
             _ => continue,
         };
 
-        if client_stream.send(AxumMessage::Text(outgoing)).await.is_err() {
+        if client_stream
+            .send(AxumMessage::Text(outgoing))
+            .await
+            .is_err()
+        {
             let _ = child.kill().await;
             break;
         }
@@ -2853,8 +3282,8 @@ fn search_douyu_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, String> 
         "https://www.douyu.com/japi/search/api/searchUser?kw={}&page=1&pageSize=30",
         urlencoding::encode(query)
     );
-    let response: SearchApiUserResponse = serde_json::from_value(fetch_search_json(&url, query)?)
-        .map_err(|err| err.to_string())?;
+    let response: SearchApiUserResponse =
+        serde_json::from_value(fetch_search_json(&url, query)?).map_err(|err| err.to_string())?;
 
     let mut results = Vec::new();
     for item in response.data.relate_user {
@@ -2936,7 +3365,9 @@ fn search_bilibili_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, Strin
                 String::new()
             },
             heat_text: if is_online {
-                room_info.map(|info| info.online.clone()).unwrap_or_default()
+                room_info
+                    .map(|info| info.online.clone())
+                    .unwrap_or_default()
             } else {
                 String::new()
             },
@@ -2951,7 +3382,10 @@ fn search_huya_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, String> {
         return Err("Missing keyword".into());
     }
 
-    let search_url = format!("https://www.huya.com/search?hsk={}", urlencoding::encode(query));
+    let search_url = format!(
+        "https://www.huya.com/search?hsk={}",
+        urlencoding::encode(query)
+    );
     let client = huya_client()?;
     let html = fetch_text_with_headers(
         &client,
@@ -2961,8 +3395,10 @@ fn search_huya_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, String> {
         None,
     )?;
 
-    let item_regex = Regex::new(r#"(?s)<li title="房间号：(?P<room_id>\d+)" class="host-item">(?P<body>.*?)</li>"#)
-        .map_err(|err| err.to_string())?;
+    let item_regex = Regex::new(
+        r#"(?s)<li title="房间号：(?P<room_id>\d+)" class="host-item">(?P<body>.*?)</li>"#,
+    )
+    .map_err(|err| err.to_string())?;
     let avatar_regex =
         Regex::new(r#"<img src="(?P<avatar>[^"]+)""#).map_err(|err| err.to_string())?;
     let nick_regex =
@@ -2972,8 +3408,15 @@ fn search_huya_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, String> {
 
     let mut candidates = Vec::new();
     for captures in item_regex.captures_iter(&html).take(12) {
-        let room_id = captures.name("room_id").map(|value| value.as_str()).unwrap_or_default().to_string();
-        let body = captures.name("body").map(|value| value.as_str()).unwrap_or_default();
+        let room_id = captures
+            .name("room_id")
+            .map(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let body = captures
+            .name("body")
+            .map(|value| value.as_str())
+            .unwrap_or_default();
         if room_id.is_empty() {
             continue;
         }
@@ -3072,7 +3515,8 @@ fn search_douyin_streamers_with_app(
         .map(|room_id| {
             let app = app.clone();
             std::thread::spawn(move || {
-                fetch_douyin_room_state_with_app(app.as_ref(), &build_douyin_live_url(&room_id)).ok()
+                fetch_douyin_room_state_with_app(app.as_ref(), &build_douyin_live_url(&room_id))
+                    .ok()
             })
         })
         .collect::<Vec<_>>();
@@ -3088,7 +3532,10 @@ fn search_douyin_streamers_with_app(
         if !matches_keyword {
             continue;
         }
-        if results.iter().any(|streamer: &SearchStreamer| streamer.room_id == state.room_id) {
+        if results
+            .iter()
+            .any(|streamer: &SearchStreamer| streamer.room_id == state.room_id)
+        {
             continue;
         }
         results.push(SearchStreamer {
@@ -3114,7 +3561,10 @@ fn search_douyin_streamers_with_app(
     Ok(results)
 }
 
-fn search_streamers_inner(app: Option<AppHandle>, keyword: &str) -> Result<Vec<SearchStreamer>, String> {
+fn search_streamers_inner(
+    app: Option<AppHandle>,
+    keyword: &str,
+) -> Result<Vec<SearchStreamer>, String> {
     let query = keyword.trim();
     if query.is_empty() {
         return Err("Missing keyword".into());
@@ -3162,7 +3612,9 @@ fn search_streamers_by_platform_inner(
     }
 }
 
-fn fetch_bilibili_room_base_infos(room_ids: &[String]) -> Result<HashMap<String, BilibiliRoomBaseInfo>, String> {
+fn fetch_bilibili_room_base_infos(
+    room_ids: &[String],
+) -> Result<HashMap<String, BilibiliRoomBaseInfo>, String> {
     let ids = room_ids
         .iter()
         .filter(|room_id| !room_id.trim().is_empty())
@@ -3176,12 +3628,9 @@ fn fetch_bilibili_room_base_infos(room_ids: &[String]) -> Result<HashMap<String,
         "https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo?{}&req_biz=web_room_componet",
         ids.join("&")
     );
-    let response: BilibiliRoomBaseInfoResponse = serde_json::from_value(fetch_bilibili_json(
-        &url,
-        "https://live.bilibili.com/",
-        "",
-    )?)
-    .map_err(|err| err.to_string())?;
+    let response: BilibiliRoomBaseInfoResponse =
+        serde_json::from_value(fetch_bilibili_json(&url, "https://live.bilibili.com/", "")?)
+            .map_err(|err| err.to_string())?;
     Ok(response.data.by_room_ids)
 }
 
@@ -3259,20 +3708,16 @@ fn open_bilibili_login(app: AppHandle) -> Result<(), String> {
         }
 
         let app_handle = app.clone();
-        WebviewWindowBuilder::new(
-            &app,
-            "bilibili-login",
-            WebviewUrl::External(login_url),
-        )
-        .title("B站 登录")
-        .inner_size(980.0, 760.0)
-        .resizable(true)
-        .center()
-        .on_page_load(move |window, _payload| {
-            maybe_capture_bilibili_login(app_handle.clone(), window);
-        })
-        .build()
-        .map_err(|err| err.to_string())?;
+        WebviewWindowBuilder::new(&app, "bilibili-login", WebviewUrl::External(login_url))
+            .title("B站 登录")
+            .inner_size(980.0, 760.0)
+            .resizable(true)
+            .center()
+            .on_page_load(move |window, _payload| {
+                maybe_capture_bilibili_login(app_handle.clone(), window);
+            })
+            .build()
+            .map_err(|err| err.to_string())?;
         spawn_bilibili_login_watcher(app);
         Ok(())
     }
@@ -3391,7 +3836,10 @@ async fn search_streamers_by_platform(
 }
 
 #[tauri::command]
-async fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Result<Vec<Streamer>, String> {
+async fn sync_streamers_status(
+    app: AppHandle,
+    streamers: Vec<Streamer>,
+) -> Result<Vec<Streamer>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut streamers = streamers;
         streamers.iter_mut().for_each(ensure_streamer_platform);
@@ -3466,16 +3914,18 @@ async fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Resu
                             if !parsed.streamer_name.trim().is_empty() {
                                 streamer.name = parsed.streamer_name;
                             }
-                            streamer.screenshot_url = if parsed.is_online && !parsed.screenshot_url.trim().is_empty() {
-                                Some(parsed.screenshot_url)
-                            } else {
-                                None
-                            };
-                            streamer.heat_text = if parsed.is_online && !parsed.heat_text.trim().is_empty() {
-                                Some(parsed.heat_text)
-                            } else {
-                                None
-                            };
+                            streamer.screenshot_url =
+                                if parsed.is_online && !parsed.screenshot_url.trim().is_empty() {
+                                    Some(parsed.screenshot_url)
+                                } else {
+                                    None
+                                };
+                            streamer.heat_text =
+                                if parsed.is_online && !parsed.heat_text.trim().is_empty() {
+                                    Some(parsed.heat_text)
+                                } else {
+                                    None
+                                };
                         }
                         Err(_) => {
                             streamer.is_online = Some(false);
@@ -3497,16 +3947,18 @@ async fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Resu
                             if !parsed.streamer_name.trim().is_empty() {
                                 streamer.name = parsed.streamer_name;
                             }
-                            streamer.screenshot_url = if parsed.is_online && !parsed.screenshot_url.trim().is_empty() {
-                                Some(parsed.screenshot_url)
-                            } else {
-                                None
-                            };
-                            streamer.heat_text = if parsed.is_online && !parsed.heat_text.trim().is_empty() {
-                                Some(parsed.heat_text)
-                            } else {
-                                None
-                            };
+                            streamer.screenshot_url =
+                                if parsed.is_online && !parsed.screenshot_url.trim().is_empty() {
+                                    Some(parsed.screenshot_url)
+                                } else {
+                                    None
+                                };
+                            streamer.heat_text =
+                                if parsed.is_online && !parsed.heat_text.trim().is_empty() {
+                                    Some(parsed.heat_text)
+                                } else {
+                                    None
+                                };
                         }
                         Err(_) => {
                             streamer.is_online = Some(false);
@@ -3528,11 +3980,12 @@ async fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Resu
                         } else if !parsed.is_online {
                             streamer.screenshot_url = None;
                         }
-                        streamer.heat_text = if !parsed.is_online || parsed.heat_text.trim().is_empty() {
-                            None
-                        } else {
-                            Some(parsed.heat_text)
-                        };
+                        streamer.heat_text =
+                            if !parsed.is_online || parsed.heat_text.trim().is_empty() {
+                                None
+                            } else {
+                                Some(parsed.heat_text)
+                            };
                         if !parsed.streamer_name.trim().is_empty() {
                             streamer.name = parsed.streamer_name;
                         }
@@ -3556,7 +4009,11 @@ async fn sync_streamers_status(app: AppHandle, streamers: Vec<Streamer>) -> Resu
 }
 
 #[tauri::command]
-async fn play_streamer(app: AppHandle, streamer: Streamer, settings: Settings) -> Result<(), String> {
+async fn play_streamer(
+    app: AppHandle,
+    streamer: Streamer,
+    settings: Settings,
+) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let platform = if streamer.platform.trim().is_empty() {
             infer_platform_from_target(&streamer.target).to_string()

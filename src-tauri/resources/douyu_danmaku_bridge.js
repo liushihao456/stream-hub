@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
 const zlib = require("node:zlib");
 
 function emit(event) {
@@ -15,6 +18,12 @@ function inferPlatform(input) {
   const value = String(input || "").trim().toLowerCase();
   if (value === "bilibili_live" || value.includes("live.bilibili.com")) {
     return "bilibili_live";
+  }
+  if (value === "huya" || value.includes("huya.com")) {
+    return "huya";
+  }
+  if (value === "douyin_live" || value.includes("live.douyin.com") || value.includes("v.douyin.com")) {
+    return "douyin_live";
   }
   return "douyu";
 }
@@ -171,6 +180,14 @@ async function fetchJson(url, options = {}) {
     throw new Error(`HTTP ${response.status} for ${url}`);
   }
   return response.json();
+}
+
+async function fetchText(url, options = {}) {
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} for ${url}`);
+  }
+  return response.text();
 }
 
 const BILI_WBI_MIXIN_KEY_ENC_TAB = [
@@ -362,6 +379,172 @@ async function connectBilibili(rawTarget) {
   };
 }
 
+const HUYA_BLOCK_LIST = [
+  "分享了直播间，房间号",
+  "录制并分享了小视频",
+  "进入直播间",
+  "刚刚在打赏君活动中",
+  "竟然抽出了",
+  "车队召集令在此",
+  "微信公众号“虎牙志愿者”",
+];
+
+let huyaScriptLoaded = false;
+
+function loadHuyaScript() {
+  if (huyaScriptLoaded) {
+    return;
+  }
+
+  const source = fs.readFileSync(path.join(__dirname, "huya.js"), "utf8");
+  vm.runInThisContext(source, { filename: "huya.js" });
+  if (
+    typeof sendRegisterGroups !== "function" ||
+    typeof sendHeartBeat !== "function" ||
+    typeof test !== "function"
+  ) {
+    throw new Error("虎牙弹幕编解码脚本加载失败");
+  }
+  huyaScriptLoaded = true;
+}
+
+function parseHuyaAnchorUidFromHtml(html) {
+  const match = String(html).match(/var\s+TT_ROOM_DATA\s*=\s*(\{.*?\});/s);
+  if (!match) {
+    return "";
+  }
+
+  try {
+    const data = JSON.parse(match[1]);
+    return String(data.id || data.uid || "");
+  } catch {
+    return "";
+  }
+}
+
+async function resolveHuyaAnchorUid(rawTarget) {
+  const target = String(rawTarget || "").trim();
+  const roomId = extractNumericId(target);
+  const pageUrl = target.startsWith("http://") || target.startsWith("https://")
+    ? target
+    : `https://www.huya.com/${encodeURIComponent(roomId || target)}`;
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+    Referer: "https://www.huya.com/",
+  };
+
+  try {
+    const html = await fetchText(pageUrl, { headers });
+    const uid = parseHuyaAnchorUidFromHtml(html);
+    if (/^\d+$/.test(uid)) {
+      return uid;
+    }
+  } catch {}
+
+  if (!roomId) {
+    return "";
+  }
+
+  try {
+    const payload = await fetchJson(
+      `https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid=${encodeURIComponent(roomId)}`,
+      { headers },
+    );
+    const uid = String(payload?.data?.liveData?.uid || payload?.data?.profileInfo?.uid || "");
+    return /^\d+$/.test(uid) ? uid : "";
+  } catch {
+    return "";
+  }
+}
+
+async function connectHuya(rawTarget) {
+  loadHuyaScript();
+
+  const anchorUid = await resolveHuyaAnchorUid(rawTarget);
+  if (!anchorUid) {
+    throw new Error("无法识别虎牙主播 UID");
+  }
+
+  let socket;
+  try {
+    socket = new WebSocket("wss://wsapi.huya.com");
+  } catch (error) {
+    emit({ type: "error", text: String(error) });
+    process.exit(1);
+  }
+
+  let heartbeat = null;
+  let connected = false;
+  socket.binaryType = "arraybuffer";
+
+  function cleanup() {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = null;
+    }
+  }
+
+  socket.onopen = () => {
+    socket.send(new Uint8Array(sendRegisterGroups([`live:${anchorUid}`, `chat:${anchorUid}`])));
+    heartbeat = setInterval(() => {
+      socket.send(new Uint8Array(sendHeartBeat()));
+    }, 30000);
+  };
+
+  socket.onmessage = event => {
+    let result = "";
+    try {
+      result = String(test(Array.from(Buffer.from(event.data))));
+    } catch {
+      return;
+    }
+
+    if (result === "EWebSocketCommandType.EWSCmdS2C_RegisterGroupRsp") {
+      if (!connected) {
+        connected = true;
+        emit({ type: "status", text: "Stream Hub 弹幕已连接" });
+      }
+      return;
+    }
+
+    if (result.startsWith("EWebSocketCommandType")) {
+      return;
+    }
+
+    let message;
+    try {
+      message = JSON.parse(result);
+    } catch {
+      return;
+    }
+
+    const text = String(message?.sMsg || "").trim();
+    if (
+      Number(message?.ePushType) === 5 &&
+      Number(message?.iUri) === 1400 &&
+      Number(message?.iProtocolType) === 2 &&
+      text &&
+      !HUYA_BLOCK_LIST.some(item => text.includes(item))
+    ) {
+      emit({ type: "chat", text });
+    }
+  };
+
+  socket.onerror = error => {
+    emit({ type: "error", text: error?.message || "虎牙弹幕连接失败" });
+    cleanup();
+    process.exit(1);
+  };
+
+  socket.onclose = event => {
+    if (!connected) {
+      emit({ type: "error", text: `虎牙弹幕连接关闭 (${event.code})` });
+    }
+    cleanup();
+    process.exit(0);
+  };
+}
+
 async function main() {
   const rawPlatform = (process.argv[2] || "").trim();
   const rawTarget = (process.argv[3] || process.argv[2] || "").trim();
@@ -373,6 +556,10 @@ async function main() {
   const platform = inferPlatform(rawPlatform || rawTarget);
   if (platform === "bilibili_live") {
     await connectBilibili(rawTarget);
+  } else if (platform === "huya") {
+    await connectHuya(rawTarget);
+  } else if (platform === "douyin_live") {
+    throw new Error("抖音弹幕由 Stream Hub 后端 WebSocket 处理");
   } else {
     await connectDouyu(extractNumericId(rawTarget));
   }

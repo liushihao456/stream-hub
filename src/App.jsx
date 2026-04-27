@@ -726,7 +726,7 @@ function App() {
                   <span>启用 IINA 弹幕</span>
                 </label>
                 <p className="settings-hint">
-                  当前弹幕仅支持斗鱼与 B站。虎牙、抖音首版只支持播放，不显示弹幕。
+                  当前 IINA 弹幕支持斗鱼、B站、虎牙、抖音。
                 </p>
                 <p className="settings-hint">
                   B站高画质通常需要登录态。可以直接用上面的登录面板完成登录。

@@ -63,14 +63,14 @@
       const laneHeight = 42;
 
       let ws = null;
-      let activeRoomID = "";
+      let activeKey = "";
 
       function stopDanmaku() {
         if (ws) {
           ws.close();
           ws = null;
         }
-        activeRoomID = "";
+        activeKey = "";
         stage.innerHTML = "";
       }
 
@@ -103,25 +103,28 @@
         });
       }
 
-      function startDanmaku(roomID, port) {
-        if (!roomID || roomID === activeRoomID) {
+      function startDanmaku(roomID, platform, port) {
+        const nextKey = `${platform || ""}:${roomID || ""}`;
+        if (!roomID || nextKey === activeKey) {
           return;
         }
 
         stopDanmaku();
-        activeRoomID = roomID;
-        ws = new WebSocket(`ws://127.0.0.1:${port}/danmaku-websocket?roomId=${encodeURIComponent(roomID)}`);
+        activeKey = nextKey;
+        ws = new WebSocket(
+          `ws://127.0.0.1:${port}/danmaku-websocket?roomId=${encodeURIComponent(roomID)}&platform=${encodeURIComponent(platform || "")}`,
+        );
 
         ws.addEventListener("message", event => {
           handleDanmakuEvent(event.data);
         });
 
         ws.addEventListener("close", () => {
-          if (activeRoomID === roomID) {
-            const reconnectRoomID = activeRoomID;
+          if (activeKey === nextKey) {
+            const reconnectKey = activeKey;
             stopDanmaku();
-            if (reconnectRoomID) {
-              setTimeout(() => startDanmaku(reconnectRoomID, port), 1500);
+            if (reconnectKey) {
+              setTimeout(() => startDanmaku(roomID, platform, port), 1500);
             }
           }
         });
@@ -132,7 +135,7 @@
       }
 
       iina.onMessage("configure", payload => {
-        startDanmaku(String(payload.roomID || ""), Number(payload.port || 19080));
+        startDanmaku(String(payload.roomID || ""), String(payload.platform || ""), Number(payload.port || 19080));
       });
 
       iina.onMessage("stop", () => {

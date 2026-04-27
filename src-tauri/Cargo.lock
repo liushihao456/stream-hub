@@ -3640,6 +3640,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "block2",
+ "flate2",
  "futures-util",
  "md5",
  "objc2-app-kit",
