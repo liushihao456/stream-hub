@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -8,18 +8,24 @@ const tabs = [
   { id: "settings", label: "设置" },
 ];
 
+const searchPlatforms = ["douyu", "bilibili_live", "huya", "douyin_live"];
+
 function PlatformIcon({ platform, iconUrls }) {
-  const isBilibili = platform === "bilibili_live";
-  const label = isBilibili ? "B站" : "斗鱼";
-  const iconUrl = isBilibili ? iconUrls.bilibili : iconUrls.douyu;
+  const iconMap = {
+    douyu: { label: "斗鱼", url: iconUrls.douyu, className: "douyu" },
+    bilibili_live: { label: "B站", url: iconUrls.bilibili, className: "bilibili" },
+    huya: { label: "虎牙", url: iconUrls.huya, className: "huya" },
+    douyin_live: { label: "抖音", url: iconUrls.douyin, className: "douyin" },
+  };
+  const config = iconMap[platform] || iconMap.douyu;
 
   return (
-    <span className={`platform-icon ${isBilibili ? "bilibili" : "douyu"}`} aria-label={label} title={label}>
-      {iconUrl ? (
-        <img className="platform-icon-image" src={iconUrl} alt="" aria-hidden="true" />
+    <span className={`platform-icon ${config.className}`} aria-label={config.label} title={config.label}>
+      {config.url ? (
+        <img className="platform-icon-image" src={config.url} alt="" aria-hidden="true" />
       ) : (
         <span className="platform-icon-fallback" aria-hidden="true">
-          {label}
+          {config.label}
         </span>
       )}
     </span>
@@ -68,20 +74,47 @@ function StreamerCard({
   menuTone = "",
 }) {
   const imageUrl = getImageForStreamer(streamer);
+  const [isClicking, setIsClicking] = useState(false);
+  const clickTimerRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (clickTimerRef.current) {
+        window.clearTimeout(clickTimerRef.current);
+      }
+    };
+  }, []);
+
+  function triggerClickFeedback() {
+    if (clickTimerRef.current) {
+      window.clearTimeout(clickTimerRef.current);
+    }
+    setIsClicking(false);
+    requestAnimationFrame(() => {
+      setIsClicking(true);
+      clickTimerRef.current = window.setTimeout(() => {
+        setIsClicking(false);
+      }, 520);
+    });
+  }
 
   return (
     <article
-      className="favorite-card"
+      className={`favorite-card ${isClicking ? "is-clicking" : ""}`}
       onMouseLeave={event => {
         setOpenMenuId(current => (current === menuId ? null : current));
         if (event.currentTarget.contains(document.activeElement)) {
           document.activeElement?.blur();
         }
       }}
-      onClick={() => onPlay(streamer)}
+      onClick={() => {
+        triggerClickFeedback();
+        onPlay(streamer);
+      }}
       onKeyDown={event => {
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
+          triggerClickFeedback();
           onPlay(streamer);
         }
       }}
@@ -194,7 +227,7 @@ function StreamerGroup({
 
 function App() {
   const [streamers, setStreamers] = useState([]);
-  const [platformIconUrls, setPlatformIconUrls] = useState({ bilibili: "", douyu: "" });
+  const [platformIconUrls, setPlatformIconUrls] = useState({ bilibili: "", douyu: "", huya: "", douyin: "" });
   const [settings, setSettings] = useState({
     player: "iina",
     iinaPath: "",
@@ -390,12 +423,42 @@ function App() {
     setSearching(true);
     setSearchPerformed(true);
     setOpenMenuId(null);
+    setSearchResults([]);
     setError("");
     setMessage("");
 
     try {
-      const results = await invoke("search_streamers", { keyword });
-      setSearchResults(results);
+      const settled = await Promise.all(
+        searchPlatforms.map(platform =>
+          invoke("search_streamers_by_platform", { platform, keyword })
+            .then(results => {
+              setSearchResults(current => {
+                const next = [...current];
+                for (const result of results) {
+                  const exists = next.some(
+                    item => item.platform === result.platform && item.target === result.target,
+                  );
+                  if (!exists) {
+                    next.push(result);
+                  }
+                }
+                return next;
+              });
+              return { ok: true, results };
+            })
+            .catch(err => ({ ok: false, error: String(err) })),
+        ),
+      );
+      const failed = settled.filter(result => !result.ok);
+      const totalResults = settled.reduce(
+        (count, result) => count + (result.ok ? result.results.length : 0),
+        0,
+      );
+      if (failed.length === settled.length) {
+        setError(`搜索主播失败：${failed[0]?.error || "全部平台搜索失败"}`);
+      } else if (failed.length > 0 && totalResults === 0) {
+        setError("部分平台搜索失败，且没有找到匹配主播");
+      }
     } catch (err) {
       setError(`搜索主播失败：${String(err)}`);
       setSearchResults([]);
@@ -414,6 +477,7 @@ function App() {
     setError("");
     setMessage("");
     try {
+      await new Promise(resolve => requestAnimationFrame(() => resolve()));
       await invoke("play_streamer", {
         streamer: {
           id: streamer.id || crypto.randomUUID(),
@@ -542,11 +606,7 @@ function App() {
             </button>
           </form>
 
-          {searching ? (
-            <div className="group-empty">正在搜索主播...</div>
-          ) : searchPerformed && searchResults.length === 0 ? (
-            <div className="group-empty">没有找到匹配的主播</div>
-          ) : searchResults.length > 0 ? (
+          {searchResults.length > 0 ? (
             <div className="favorites-groups">
               <StreamerGroup
                 title="已开播"
@@ -586,6 +646,10 @@ function App() {
                 })}
               />
             </div>
+          ) : searching ? (
+            <div className="group-empty">正在搜索主播...</div>
+          ) : searchPerformed && searchResults.length === 0 ? (
+            <div className="group-empty">没有找到匹配的主播</div>
           ) : (
             <div className="group-empty">输入主播名字后，就会在这里显示搜索结果</div>
           )}
@@ -662,7 +726,7 @@ function App() {
                   <span>启用 IINA 弹幕</span>
                 </label>
                 <p className="settings-hint">
-                  选择 IINA 时，播放前会自动安装并更新内置弹幕插件。mpv 模式只播放直播，不显示弹幕。
+                  当前弹幕仅支持斗鱼与 B站。虎牙、抖音首版只支持播放，不显示弹幕。
                 </p>
                 <p className="settings-hint">
                   B站高画质通常需要登录态。可以直接用上面的登录面板完成登录。
