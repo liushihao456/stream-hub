@@ -35,6 +35,12 @@ use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use url::Url;
 use uuid::Uuid;
 
+mod player;
+
+#[cfg(target_os = "macos")]
+use objc2::runtime::AnyObject;
+#[cfg(target_os = "macos")]
+use objc2::{class, msg_send};
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 #[cfg(target_os = "macos")]
@@ -2078,6 +2084,38 @@ fn extract_bilibili_cookie_from_window<R: tauri::Runtime>(
     Ok(None)
 }
 
+#[cfg(target_os = "macos")]
+fn configure_main_webview_transparency<R: tauri::Runtime>(
+    window: &WebviewWindow<R>,
+) -> Result<(), String> {
+    window
+        .with_webview(|webview| unsafe {
+            let view: &WKWebView = &*webview.inner().cast();
+            let ns_color_class = class!(NSColor);
+            let clear_color: *mut AnyObject = msg_send![ns_color_class, clearColor];
+            let ns_number_class = class!(NSNumber);
+            let false_value: *mut AnyObject = msg_send![ns_number_class, numberWithBool: false];
+            let draws_background_key = NSString::from_str("drawsBackground");
+            let enclosing_scroll_view: *mut AnyObject = msg_send![view, enclosingScrollView];
+
+            let _: () = msg_send![view, setOpaque: false];
+            let _: () = msg_send![view, setBackgroundColor: clear_color];
+            let _: () = msg_send![view, setUnderPageBackgroundColor: clear_color];
+            let _: () = msg_send![view, setValue: false_value, forKey: &*draws_background_key];
+
+            if !enclosing_scroll_view.is_null() {
+                let _: () = msg_send![enclosing_scroll_view, setDrawsBackground: false];
+                let _: () = msg_send![enclosing_scroll_view, setBackgroundColor: clear_color];
+                let clip_view: *mut AnyObject = msg_send![enclosing_scroll_view, contentView];
+                if !clip_view.is_null() {
+                    let _: () = msg_send![clip_view, setDrawsBackground: false];
+                    let _: () = msg_send![clip_view, setBackgroundColor: clear_color];
+                }
+            }
+        })
+        .map_err(|err| format!("配置主窗口 WebView 透明背景失败：{err}"))
+}
+
 fn save_bilibili_cookie_and_notify(app: &AppHandle, cookie: String) -> Result<Settings, String> {
     let mut settings = load_settings_inner(app)?;
     settings.bilibili_cookie = cookie;
@@ -2165,8 +2203,35 @@ fn normalize_player(settings: &Settings) -> String {
     let player = settings.player.trim().to_lowercase();
     if player.is_empty() {
         default_player().to_string()
-    } else {
+    } else if matches!(player.as_str(), "iina" | "mpv" | "libmpv") {
         player
+    } else {
+        default_player().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_player, normalize_player, Settings};
+
+    #[test]
+    fn normalize_player_accepts_libmpv() {
+        let settings = Settings {
+            player: "libmpv".to_string(),
+            ..Settings::default()
+        };
+
+        assert_eq!(normalize_player(&settings), "libmpv");
+    }
+
+    #[test]
+    fn normalize_player_falls_back_for_unknown_values() {
+        let settings = Settings {
+            player: "vlc".to_string(),
+            ..Settings::default()
+        };
+
+        assert_eq!(normalize_player(&settings), default_player());
     }
 }
 
@@ -4014,17 +4079,22 @@ async fn play_streamer(
     streamer: Streamer,
     settings: Settings,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let platform = if streamer.platform.trim().is_empty() {
-            infer_platform_from_target(&streamer.target).to_string()
+    let streamer_for_extract = streamer.clone();
+    let settings_for_extract = settings.clone();
+    let app_for_extract = app.clone();
+    let settings_for_extract_task = settings.clone();
+    let streamer_for_extract_task = streamer.clone();
+    let extracted = tauri::async_runtime::spawn_blocking(move || {
+        let platform = if streamer_for_extract_task.platform.trim().is_empty() {
+            infer_platform_from_target(&streamer_for_extract_task.target).to_string()
         } else {
-            normalize_platform(&streamer.platform).to_string()
+            normalize_platform(&streamer_for_extract_task.platform).to_string()
         };
         let data = extract_play_info_for_platform_with_app(
-            Some(&app),
+            Some(&app_for_extract),
             &platform,
-            &streamer.target,
-            &settings.bilibili_cookie,
+            &streamer_for_extract_task.target,
+            &settings_for_extract_task.bilibili_cookie,
         )?;
         if !data.is_online {
             return Err("主播当前未开播".into());
@@ -4040,21 +4110,64 @@ async fn play_streamer(
             data.title.clone()
         };
 
-        match normalize_player(&settings).as_str() {
-            "iina" => open_iina_playlist(&app, &settings, &playlist_path, &media_title, &data),
-            _ => open_mpv_playlist(&playlist_path, &media_title, &data, &settings),
-        }
+        Ok::<_, String>((data, playlist_path, media_title))
     })
     .await
-    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())??;
+
+    let (data, playlist_path, media_title) = extracted;
+
+    match normalize_player(&settings).as_str() {
+        "libmpv" => app.state::<player::EmbeddedPlayerManager>().play(
+            &app,
+            streamer_for_extract,
+            settings_for_extract,
+            data,
+            media_title,
+        ),
+        "iina" => open_iina_playlist(&app, &settings, &playlist_path, &media_title, &data),
+        _ => open_mpv_playlist(&playlist_path, &media_title, &data, &settings),
+    }
+}
+
+#[tauri::command]
+fn embedded_player_set_bounds(
+    app: AppHandle,
+    bounds: player::EmbeddedPlayerBounds,
+) -> Result<player::EmbeddedPlayerSnapshot, String> {
+    app.state::<player::EmbeddedPlayerManager>()
+        .set_bounds(&app, bounds)
+}
+
+#[tauri::command]
+fn embedded_player_get_state(app: AppHandle) -> Result<player::EmbeddedPlayerSnapshot, String> {
+    Ok(app.state::<player::EmbeddedPlayerManager>().get_state())
+}
+
+#[tauri::command]
+fn embedded_player_command(
+    app: AppHandle,
+    command: player::EmbeddedPlayerCommandPayload,
+) -> Result<player::EmbeddedPlayerSnapshot, String> {
+    app.state::<player::EmbeddedPlayerManager>()
+        .command(&app, command)
 }
 
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            #[cfg(target_os = "macos")]
+            if let Some(window) = app.get_webview_window("main") {
+                configure_main_webview_transparency(&window)?;
+            }
+
+            Ok(())
+        })
         .manage(Arc::new(DanmakuServerState {
             started: AtomicBool::new(false),
             port: 19080,
         }))
+        .manage(player::EmbeddedPlayerManager::new())
         .invoke_handler(tauri::generate_handler![
             load_streamers,
             save_streamers,
@@ -4069,7 +4182,10 @@ pub fn run() {
             search_streamers,
             search_streamers_by_platform,
             sync_streamers_status,
-            play_streamer
+            play_streamer,
+            embedded_player_set_bounds,
+            embedded_player_get_state,
+            embedded_player_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

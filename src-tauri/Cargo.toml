@@ -17,12 +17,15 @@ axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"
 flate2 = "1"
 futures-util = "0.3"
+libmpv-sys = "3.1.0"
 md5 = "0.8"
 regex = "1"
 block2 = "0.6.2"
+objc2 = "0.6.2"
 objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
 objc2-web-kit = { version = "0.3.2", features = ["block2", "WKHTTPCookieStore", "WKWebsiteDataStore", "WKWebView", "WKWebViewConfiguration"] }
+raw-window-handle = "0.6.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,3 +35,6 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 urlencoding = "2"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

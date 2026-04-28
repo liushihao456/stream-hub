@@ -1857,6 +1857,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libmpv-sys"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0df938d3145cd8f134572721a27afa3a51f9bc1c26ae30a1d5077162f96d074b"
+
+[[package]]
 name = "libredox"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3642,10 +3648,13 @@ dependencies = [
  "block2",
  "flate2",
  "futures-util",
+ "libmpv-sys",
  "md5",
+ "objc2",
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-web-kit",
+ "raw-window-handle",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -3657,6 +3666,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

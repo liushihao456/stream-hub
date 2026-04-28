@@ -9,6 +9,19 @@ const tabs = [
 ];
 
 const searchPlatforms = ["douyu", "bilibili_live", "huya", "douyin_live"];
+const PLAYBACK_BACK_HIDE_DELAY_MS = 5000;
+const emptyEmbeddedPlayerState = {
+  phase: "idle",
+  title: "",
+  streamerName: "",
+  platform: "",
+  visible: false,
+  paused: false,
+  muted: false,
+  volume: 100,
+  usingExternalPlayer: false,
+  errorMessage: "",
+};
 
 function PlatformIcon({ platform, iconUrls }) {
   const iconMap = {
@@ -47,6 +60,21 @@ function RefreshIcon() {
         fill="none"
         stroke="currentColor"
         strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function LeftChevronIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="playback-back-icon">
+      <path
+        d="M14.5 5.5 8 12l6.5 6.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.9"
         strokeLinecap="round"
         strokeLinejoin="round"
       />
@@ -225,6 +253,32 @@ function StreamerGroup({
   );
 }
 
+function PlaybackPage({
+  surfaceRef,
+  backButtonVisible,
+  onBack,
+  onPointerMove,
+}) {
+  return (
+    <main className="playback-page" onPointerMove={onPointerMove}>
+      <div
+        ref={surfaceRef}
+        className="playback-stage"
+        aria-label="直播画面区域"
+      />
+      <button
+        type="button"
+        className={`playback-back-button ${backButtonVisible ? "visible" : ""}`}
+        onClick={onBack}
+        aria-label="返回"
+        title="返回"
+      >
+        <LeftChevronIcon />
+      </button>
+    </main>
+  );
+}
+
 function App() {
   const [streamers, setStreamers] = useState([]);
   const [platformIconUrls, setPlatformIconUrls] = useState({ bilibili: "", douyu: "", huya: "", douyin: "" });
@@ -246,11 +300,88 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [embeddedPlayer, setEmbeddedPlayer] = useState(emptyEmbeddedPlayerState);
+  const [viewMode, setViewMode] = useState("browse");
+  const [playbackBackVisible, setPlaybackBackVisible] = useState(false);
+  const playerSurfaceRef = useRef(null);
+  const boundsFrameRef = useRef(0);
+  const lastBoundsRef = useRef("");
+  const boundsRequestInFlightRef = useRef(false);
+  const pendingBoundsRef = useRef(null);
+  const playbackOriginRef = useRef({ activeTab: "favorites", scrollY: 0 });
+  const restoreScrollRef = useRef(null);
+  const playbackBackHideTimerRef = useRef(0);
+  const playbackExitInFlightRef = useRef(false);
+  const playbackAwaitingStartRef = useRef(false);
+
+  function clearPlaybackBackHideTimer() {
+    if (playbackBackHideTimerRef.current) {
+      window.clearTimeout(playbackBackHideTimerRef.current);
+      playbackBackHideTimerRef.current = 0;
+    }
+  }
+
+  function restoreBrowseView() {
+    playbackAwaitingStartRef.current = false;
+    clearPlaybackBackHideTimer();
+    setPlaybackBackVisible(false);
+    setViewMode("browse");
+    setActiveTab(playbackOriginRef.current.activeTab);
+    restoreScrollRef.current = playbackOriginRef.current.scrollY;
+  }
+
+  function revealPlaybackBackButton() {
+    if (viewMode !== "playback") {
+      return;
+    }
+    setPlaybackBackVisible(true);
+    clearPlaybackBackHideTimer();
+    playbackBackHideTimerRef.current = window.setTimeout(() => {
+      setPlaybackBackVisible(false);
+      playbackBackHideTimerRef.current = 0;
+    }, PLAYBACK_BACK_HIDE_DELAY_MS);
+  }
+
+  function enterPlaybackView() {
+    playbackAwaitingStartRef.current = true;
+    playbackOriginRef.current = {
+      activeTab,
+      scrollY: window.scrollY || window.pageYOffset || 0,
+    };
+    restoreScrollRef.current = null;
+    clearPlaybackBackHideTimer();
+    setPlaybackBackVisible(false);
+    setViewMode("playback");
+    window.scrollTo(0, 0);
+  }
+
+  async function exitPlaybackView({ stopPlayback }) {
+    if (playbackExitInFlightRef.current) {
+      return;
+    }
+    playbackExitInFlightRef.current = true;
+
+    try {
+      if (stopPlayback) {
+        const next = await invoke("embedded_player_command", {
+          command: { kind: "stop" },
+        });
+        setEmbeddedPlayer(next);
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      restoreBrowseView();
+      playbackExitInFlightRef.current = false;
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
     let unlistenUpdated;
     let unlistenError;
+    let unlistenEmbeddedState;
+    let unlistenEmbeddedError;
 
     async function bootstrap() {
       try {
@@ -267,14 +398,22 @@ function App() {
         unlistenError = await listen("bilibili-login-error", event => {
           setError(String(event.payload));
         });
+        unlistenEmbeddedState = await listen("embedded-player-state", event => {
+          setEmbeddedPlayer(current => ({ ...current, ...event.payload }));
+        });
+        unlistenEmbeddedError = await listen("embedded-player-error", event => {
+          setError(String(event.payload));
+        });
 
-        const [savedStreamers, savedSettings] = await Promise.all([
+        const [savedStreamers, savedSettings, embeddedState] = await Promise.all([
           invoke("load_streamers"),
           invoke("load_settings"),
+          invoke("embedded_player_get_state"),
         ]);
 
         if (!cancelled) {
           setSettings(savedSettings);
+          setEmbeddedPlayer(embeddedState);
           if (savedStreamers.length > 0) {
             const syncedStreamers = await invoke("sync_streamers_status", { streamers: savedStreamers });
             if (!cancelled) {
@@ -300,8 +439,196 @@ function App() {
       cancelled = true;
       unlistenUpdated?.();
       unlistenError?.();
+      unlistenEmbeddedState?.();
+      unlistenEmbeddedError?.();
     };
   }, []);
+
+  useEffect(() => {
+    return () => {
+      clearPlaybackBackHideTimer();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (settings.player === "libmpv") {
+      return;
+    }
+
+    if (viewMode === "playback") {
+      restoreBrowseView();
+    }
+
+    if (!embeddedPlayer.visible && embeddedPlayer.phase === "idle") {
+      return;
+    }
+
+    invoke("embedded_player_command", {
+      command: { kind: "stop" },
+    }).catch(() => {});
+  }, [settings.player, embeddedPlayer.phase, embeddedPlayer.visible, viewMode]);
+
+  useEffect(() => {
+    if (viewMode !== "browse" || restoreScrollRef.current == null) {
+      return undefined;
+    }
+
+    const scrollY = restoreScrollRef.current;
+    const frame = window.requestAnimationFrame(() => {
+      window.scrollTo(0, scrollY);
+      restoreScrollRef.current = null;
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+    };
+  }, [viewMode, activeTab]);
+
+  useEffect(() => {
+    const html = document.documentElement;
+    const body = document.body;
+    const root = document.getElementById("root");
+    const playbackActive = viewMode === "playback";
+
+    html.classList.toggle("playback-mode", playbackActive);
+    body.classList.toggle("playback-mode", playbackActive);
+    root?.classList.toggle("playback-mode-root", playbackActive);
+
+    return () => {
+      html.classList.remove("playback-mode");
+      body.classList.remove("playback-mode");
+      root?.classList.remove("playback-mode-root");
+    };
+  }, [viewMode]);
+
+  useEffect(() => {
+    if (viewMode !== "playback") {
+      return undefined;
+    }
+
+    function handleKeyDown(event) {
+      if (event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      void exitPlaybackView({ stopPlayback: true });
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [viewMode, embeddedPlayer.visible, embeddedPlayer.phase]);
+
+  useEffect(() => {
+    if (viewMode !== "playback") {
+      playbackAwaitingStartRef.current = false;
+      return;
+    }
+
+    if (embeddedPlayer.visible || embeddedPlayer.phase !== "idle") {
+      playbackAwaitingStartRef.current = false;
+    }
+  }, [viewMode, embeddedPlayer.visible, embeddedPlayer.phase]);
+
+  useEffect(() => {
+    if (viewMode !== "playback" || playbackExitInFlightRef.current) {
+      return;
+    }
+
+    if (embeddedPlayer.errorMessage) {
+      void exitPlaybackView({ stopPlayback: embeddedPlayer.visible || embeddedPlayer.phase !== "idle" });
+      return;
+    }
+
+    if (embeddedPlayer.phase === "ended") {
+      void exitPlaybackView({ stopPlayback: embeddedPlayer.visible || embeddedPlayer.phase !== "idle" });
+      return;
+    }
+
+    if (embeddedPlayer.phase === "idle" && !embeddedPlayer.visible) {
+      if (playbackAwaitingStartRef.current) {
+        return;
+      }
+      restoreBrowseView();
+    }
+  }, [viewMode, embeddedPlayer.phase, embeddedPlayer.visible, embeddedPlayer.errorMessage]);
+
+  useEffect(() => {
+    const element = playerSurfaceRef.current;
+    const shouldTrack = settings.player === "libmpv" && viewMode === "playback";
+    if (!element || !shouldTrack) {
+      return undefined;
+    }
+
+    function pushBounds(bounds, signature) {
+      boundsRequestInFlightRef.current = true;
+      invoke("embedded_player_set_bounds", { bounds })
+        .catch(err => {
+          setError(String(err));
+        })
+        .finally(() => {
+          boundsRequestInFlightRef.current = false;
+          const pending = pendingBoundsRef.current;
+          pendingBoundsRef.current = null;
+          if (pending && pending.signature !== signature) {
+            pushBounds(pending.bounds, pending.signature);
+          }
+        });
+    }
+
+    function scheduleBoundsSync() {
+      if (boundsFrameRef.current) {
+        return;
+      }
+      boundsFrameRef.current = window.requestAnimationFrame(() => {
+        boundsFrameRef.current = 0;
+        const target = playerSurfaceRef.current;
+        if (!target) {
+          return;
+        }
+        const rect = target.getBoundingClientRect();
+        const scaleFactor = window.devicePixelRatio || 1;
+        const bounds = {
+          x: Math.round(rect.left * scaleFactor),
+          y: Math.round(rect.top * scaleFactor),
+          width: Math.max(1, Math.round(rect.width * scaleFactor)),
+          height: Math.max(1, Math.round(rect.height * scaleFactor)),
+          scaleFactor,
+          viewportHeight: Math.max(1, Math.round(window.innerHeight * scaleFactor)),
+        };
+        const signature = `${bounds.x}:${bounds.y}:${bounds.width}:${bounds.height}:${bounds.scaleFactor}:${bounds.viewportHeight}`;
+        if (signature === lastBoundsRef.current) {
+          return;
+        }
+        lastBoundsRef.current = signature;
+        if (boundsRequestInFlightRef.current) {
+          pendingBoundsRef.current = { bounds, signature };
+          return;
+        }
+        pushBounds(bounds, signature);
+      });
+    }
+
+    const observer = new ResizeObserver(() => {
+      scheduleBoundsSync();
+    });
+    observer.observe(element);
+    window.addEventListener("resize", scheduleBoundsSync);
+    scheduleBoundsSync();
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", scheduleBoundsSync);
+      if (boundsFrameRef.current) {
+        window.cancelAnimationFrame(boundsFrameRef.current);
+        boundsFrameRef.current = 0;
+      }
+      pendingBoundsRef.current = null;
+      boundsRequestInFlightRef.current = false;
+      lastBoundsRef.current = "";
+    };
+  }, [settings.player, viewMode]);
 
   async function persistStreamers(nextStreamers, nextMessage = "主播列表已保存") {
     setSaving(true);
@@ -477,6 +804,9 @@ function App() {
     setError("");
     setMessage("");
     try {
+      if (settings.player === "libmpv") {
+        enterPlaybackView();
+      }
       await new Promise(resolve => requestAnimationFrame(() => resolve()));
       await invoke("play_streamer", {
         streamer: {
@@ -492,6 +822,9 @@ function App() {
         settings,
       });
     } catch (err) {
+      if (settings.player === "libmpv") {
+        restoreBrowseView();
+      }
       setError(String(err));
     }
   }
@@ -501,6 +834,19 @@ function App() {
       <main className="shell">
         <section className="loading-view">正在加载应用数据...</section>
       </main>
+    );
+  }
+
+  if (viewMode === "playback") {
+    return (
+      <PlaybackPage
+        surfaceRef={playerSurfaceRef}
+        backButtonVisible={playbackBackVisible}
+        onBack={() => {
+          void exitPlaybackView({ stopPlayback: true });
+        }}
+        onPointerMove={revealPlaybackBackButton}
+      />
     );
   }
 
@@ -675,25 +1021,39 @@ function App() {
               >
                 mpv
               </button>
+              <button
+                type="button"
+                className={`player-picker-button ${settings.player === "libmpv" ? "active" : ""}`}
+                onClick={() => setSettings(current => ({ ...current, player: "libmpv" }))}
+              >
+                libmpv
+              </button>
             </div>
-            <div className="player-settings">
-              <label className="search-field">
-                <input
-                  value={settings.player === "iina" ? settings.iinaPath : settings.mpvPath}
-                  onChange={event =>
-                    setSettings(current => (
+            <div className={`player-settings ${settings.player === "libmpv" ? "single-action" : ""}`}>
+              {settings.player === "libmpv" ? (
+                <div className="player-inline-note">
+                  <strong>主窗口内嵌播放已启用。</strong>
+                  <span>该模式依赖系统已安装 `libmpv`，首版暂不启用弹幕。</span>
+                </div>
+              ) : (
+                <label className="search-field">
+                  <input
+                    value={settings.player === "iina" ? settings.iinaPath : settings.mpvPath}
+                    onChange={event =>
+                      setSettings(current => (
+                        settings.player === "iina"
+                          ? { ...current, iinaPath: event.target.value }
+                          : { ...current, mpvPath: event.target.value }
+                      ))
+                    }
+                    placeholder={
                       settings.player === "iina"
-                        ? { ...current, iinaPath: event.target.value }
-                        : { ...current, mpvPath: event.target.value }
-                    ))
-                  }
-                  placeholder={
-                    settings.player === "iina"
-                      ? "IINA.app 或 iina-cli 路径 留空则自动查找"
-                      : "mpv 路径 留空则使用系统 PATH 中的 mpv"
-                  }
-                />
-              </label>
+                        ? "IINA.app 或 iina-cli 路径 留空则自动查找"
+                        : "mpv 路径 留空则使用系统 PATH 中的 mpv"
+                    }
+                  />
+                </label>
+              )}
               <button type="button" className="ghost-button" disabled={saving} onClick={() => persistSettings(settings)}>
                 保存
               </button>
@@ -732,12 +1092,24 @@ function App() {
                   B站高画质通常需要登录态。可以直接用上面的登录面板完成登录。
                 </p>
               </div>
+            ) : settings.player === "libmpv" ? (
+              <div className="player-extra">
+                <p className="settings-hint">
+                  libmpv 模式会把画面直接嵌入主窗口，并沿用当前直播提流与备用线路逻辑。
+                </p>
+                <p className="settings-hint">
+                  如果系统缺少 `libmpv` 或播放异常，可以随时切回 IINA / mpv 外部模式。
+                </p>
+              </div>
             ) : (
               <p className="settings-hint">mpv 模式当前不启用弹幕。B站高画质同样可以使用上面的登录面板。</p>
             )}
           </div>
         </section>
       )}
+
+      {message ? <div className="notice-strip success">{message}</div> : null}
+      {error ? <div className="notice-strip error">{error}</div> : null}
 
     </main>
   );
