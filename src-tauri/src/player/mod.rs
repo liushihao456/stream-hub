@@ -190,8 +190,8 @@ impl EmbeddedPlayerManager {
                 .lock()
                 .map_err(|_| "播放器状态锁已损坏".to_string())?;
             state.last_streamer = Some(streamer);
-            state.last_settings = Some(settings);
             state.last_load_debug = Some(build_last_load_debug(&data));
+            state.last_settings = Some(settings.clone());
             state.media_title = media_title.clone();
             state.snapshot.phase = "loading".to_string();
             state.snapshot.title = media_title.clone();
@@ -206,7 +206,7 @@ impl EmbeddedPlayerManager {
                     backend.host.set_bounds(app, &bounds)?;
                 }
                 backend.host.set_visible(app, true)?;
-                configure_mpv_for_playback(backend.ctx_ptr(), &data, &media_title)?;
+                configure_mpv_for_playback(backend.ctx_ptr(), &data, &media_title, &settings)?;
                 load_stream_urls(backend.ctx_ptr(), &data)?;
                 #[cfg(target_os = "macos")]
                 backend.host.request_redraw();
@@ -427,7 +427,7 @@ impl EmbeddedPlayerManager {
                     }
                     MPV_EVENT_LOG_MESSAGE => {
                         let log = unsafe { &*(event.data as *const mpv_event_log_message) };
-                        emitted_error = mpv_log_message_text(log);
+                        emitted_error = mpv_log_message_text(log, state.snapshot.visible);
                     }
                     _ => {}
                 }
@@ -569,23 +569,36 @@ fn configure_mpv_for_playback(
     ctx: *mut mpv_handle,
     data: &ExtractResult,
     media_title: &str,
+    settings: &Settings,
 ) -> Result<(), String> {
     set_mpv_string_property(ctx, "force-media-title", media_title)?;
     if data.platform == crate::PLATFORM_BILIBILI_LIVE {
-        clear_mpv_string_property(ctx, "user-agent")?;
+        set_mpv_string_property(ctx, "user-agent", crate::BILIBILI_USER_AGENT)?;
+        set_mpv_string_property(ctx, "referrer", "https://live.bilibili.com/")?;
+        if let Some(cookie) = crate::build_bilibili_cookie_string(&settings.bilibili_cookie)? {
+            set_mpv_string_property(ctx, "http-header-fields", &format!("Cookie: {cookie}"))?;
+        } else {
+            clear_mpv_string_property(ctx, "http-header-fields")?;
+        }
     } else if data.platform == crate::PLATFORM_HUYA {
         set_mpv_string_property(ctx, "user-agent", crate::HUYA_USER_AGENT)?;
+        set_mpv_string_property(ctx, "referrer", "https://www.huya.com/")?;
+        clear_mpv_string_property(ctx, "http-header-fields")?;
     } else if data.platform == crate::PLATFORM_DOUYIN_LIVE {
         set_mpv_string_property(ctx, "user-agent", crate::DOUYIN_USER_AGENT)?;
+        set_mpv_string_property(ctx, "referrer", "https://live.douyin.com/")?;
+        clear_mpv_string_property(ctx, "http-header-fields")?;
     } else {
         clear_mpv_string_property(ctx, "user-agent")?;
+        clear_mpv_string_property(ctx, "referrer")?;
+        clear_mpv_string_property(ctx, "http-header-fields")?;
     }
 
     Ok(())
 }
 
 fn load_stream_urls(ctx: *mut mpv_handle, data: &ExtractResult) -> Result<(), String> {
-    let option_string = build_loadfile_option_string(data);
+    let option_string = build_loadfile_option_string();
 
     for (index, url) in data.urls.iter().enumerate() {
         let mut args = vec![
@@ -618,31 +631,16 @@ fn build_last_load_debug(data: &ExtractResult) -> LastLoadDebug {
     LastLoadDebug {
         platform: data.platform.clone(),
         first_url: data.urls.first().cloned().unwrap_or_default(),
-        option_string: build_loadfile_option_string(data),
+        option_string: build_loadfile_option_string(),
         url_count: data.urls.len(),
     }
 }
 
-fn build_loadfile_option_string(data: &ExtractResult) -> String {
-    let mut options = vec![
+fn build_loadfile_option_string() -> String {
+    let options = [
         "ytdl=no".to_string(),
         "stream-lavf-o=reconnect_streamed=yes".to_string(),
     ];
-
-    match data.platform.as_str() {
-        crate::PLATFORM_BILIBILI_LIVE => {
-            options.push("referrer=https://live.bilibili.com/".to_string());
-        }
-        crate::PLATFORM_HUYA => {
-            options.push("referrer=https://www.huya.com/".to_string());
-            options.push(format!("user-agent={}", crate::HUYA_USER_AGENT));
-        }
-        crate::PLATFORM_DOUYIN_LIVE => {
-            options.push("referrer=https://live.douyin.com/".to_string());
-            options.push(format!("user-agent={}", crate::DOUYIN_USER_AGENT));
-        }
-        _ => {}
-    }
 
     options.join(",")
 }
@@ -838,7 +836,11 @@ fn mpv_error_message(status: i32) -> String {
     }
 }
 
-fn mpv_log_message_text(log: &mpv_event_log_message) -> Option<String> {
+fn mpv_log_message_text(log: &mpv_event_log_message, playback_visible: bool) -> Option<String> {
+    if !playback_visible {
+        return None;
+    }
+
     let level = unsafe {
         (!log.level.is_null()).then(|| CStr::from_ptr(log.level).to_string_lossy().to_string())
     }
@@ -856,11 +858,19 @@ fn mpv_log_message_text(log: &mpv_event_log_message) -> Option<String> {
         })
     }?;
 
-    if text.is_empty() {
+    if text.is_empty() || is_non_actionable_mpv_log(&prefix, &level, &text) {
         None
     } else {
         Some(format!("[{prefix}/{level}] {text}"))
     }
+}
+
+fn is_non_actionable_mpv_log(prefix: &str, _level: &str, text: &str) -> bool {
+    let normalized_prefix = prefix.trim().to_ascii_lowercase();
+    let normalized_text = text.trim().to_ascii_lowercase();
+
+    normalized_prefix.starts_with("ffmpeg/video")
+        || normalized_text.contains("missing picture in access unit")
 }
 
 fn format_end_file_error(
@@ -889,7 +899,7 @@ fn format_end_file_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{EmbeddedPlayerCommandPayload, ParsedCommand};
+    use super::{is_non_actionable_mpv_log, EmbeddedPlayerCommandPayload, ParsedCommand};
 
     #[test]
     fn parses_libmpv_commands() {
@@ -910,5 +920,14 @@ mod tests {
             value: None,
         };
         assert!(ParsedCommand::from_payload(payload).is_err());
+    }
+
+    #[test]
+    fn filters_ffmpeg_decoder_noise() {
+        assert!(is_non_actionable_mpv_log(
+            "ffmpeg/video",
+            "error",
+            "h264: missing picture in access unit with size 4254",
+        ));
     }
 }

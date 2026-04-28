@@ -45,7 +45,7 @@ button {
   cursor: pointer;
 }
 
-input:not([type="checkbox"]) {
+input:not([type="checkbox"]):not([type="range"]) {
   width: 100%;
   border: 1px solid #2a2f38;
   border-radius: 18px;
@@ -55,7 +55,7 @@ input:not([type="checkbox"]) {
   color: #f2efe9;
 }
 
-input:not([type="checkbox"]):focus,
+input:not([type="checkbox"]):not([type="range"]):focus,
 button:focus {
   outline: 2px solid #9fb2ff;
   outline-offset: 2px;
@@ -84,6 +84,46 @@ button:focus {
   position: absolute;
   inset: 0;
   background: transparent;
+}
+
+.playback-danmaku-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 55;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.playback-danmaku-item {
+  position: absolute;
+  left: 100%;
+  max-width: min(72vw, 1100px);
+  padding: 0 0.2rem;
+  color: #ffffff;
+  font-size: clamp(1rem, 1.6vw, 1.7rem);
+  font-weight: 400;
+  line-height: 1.15;
+  white-space: nowrap;
+  text-shadow:
+    -1px -1px 0 rgba(0, 0, 0, 0.9),
+    1px -1px 0 rgba(0, 0, 0, 0.9),
+    -1px 1px 0 rgba(0, 0, 0, 0.9),
+    1px 1px 0 rgba(0, 0, 0, 0.9),
+    0 4px 14px rgba(0, 0, 0, 0.45);
+  will-change: transform;
+  animation-name: playback-danmaku-scroll;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+
+@keyframes playback-danmaku-scroll {
+  from {
+    transform: translate3d(0, 0, 0);
+  }
+
+  to {
+    transform: translate3d(calc(-100vw - 100% - 4rem), 0, 0);
+  }
 }
 
 .playback-back-button {
@@ -812,6 +852,34 @@ button:focus {
 
 .player-extra {
   margin-top: 0.9rem;
+}
+
+.setting-stack {
+  display: grid;
+  gap: 0.8rem;
+  color: #d9dfeb;
+}
+
+.setting-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.setting-label-row strong {
+  color: #f3f6fb;
+  font-size: 0.95rem;
+}
+
+.setting-stack input[type="range"] {
+  width: 100%;
+}
+
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.85rem;
 }
 
 .player-settings.single-action {

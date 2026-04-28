@@ -9,7 +9,10 @@ const tabs = [
 ];
 
 const searchPlatforms = ["douyu", "bilibili_live", "huya", "douyin_live"];
-const PLAYBACK_BACK_HIDE_DELAY_MS = 5000;
+const PLAYBACK_BACK_HIDE_DELAY_MS = 2000;
+const DEFAULT_DANMAKU_FONT_SIZE = 18;
+const DANMAKU_TOP_PADDING = 24;
+const DANMAKU_BOTTOM_PADDING = 28;
 const emptyEmbeddedPlayerState = {
   phase: "idle",
   title: "",
@@ -22,6 +25,25 @@ const emptyEmbeddedPlayerState = {
   usingExternalPlayer: false,
   errorMessage: "",
 };
+
+function parseDanmakuPayload(raw) {
+  try {
+    const payload = JSON.parse(raw);
+    const kind = typeof payload?.kind === "string" ? payload.kind : "chat";
+    const texts = Array.isArray(payload?.dms)
+      ? payload.dms
+          .map(item => (typeof item?.text === "string" ? item.text.trim() : ""))
+          .filter(Boolean)
+      : [];
+    return { kind, texts };
+  } catch {
+    const text = String(raw).trim();
+    return {
+      kind: "chat",
+      texts: text ? [text] : [],
+    };
+  }
+}
 
 function PlatformIcon({ platform, iconUrls }) {
   const iconMap = {
@@ -256,6 +278,8 @@ function StreamerGroup({
 function PlaybackPage({
   surfaceRef,
   backButtonVisible,
+  danmakuItems,
+  danmakuFontSize,
   onBack,
   onPointerMove,
 }) {
@@ -265,7 +289,23 @@ function PlaybackPage({
         ref={surfaceRef}
         className="playback-stage"
         aria-label="直播画面区域"
-      />
+      >
+        <div className="playback-danmaku-layer" aria-hidden="true">
+          {danmakuItems.map(item => (
+            <div
+              key={item.id}
+              className="playback-danmaku-item"
+              style={{
+                top: `${item.top}px`,
+                fontSize: `${danmakuFontSize}px`,
+                animationDuration: `${item.durationMs}ms`,
+              }}
+            >
+              {item.text}
+            </div>
+          ))}
+        </div>
+      </div>
       <button
         type="button"
         className={`playback-back-button ${backButtonVisible ? "visible" : ""}`}
@@ -283,11 +323,9 @@ function App() {
   const [streamers, setStreamers] = useState([]);
   const [platformIconUrls, setPlatformIconUrls] = useState({ bilibili: "", douyu: "", huya: "", douyin: "" });
   const [settings, setSettings] = useState({
-    player: "iina",
-    iinaPath: "",
-    mpvPath: "",
+    player: "libmpv",
     bilibiliCookie: "",
-    enableIinaDanmaku: true,
+    danmakuFontSize: DEFAULT_DANMAKU_FONT_SIZE,
   });
   const [activeTab, setActiveTab] = useState("favorites");
   const [searchInput, setSearchInput] = useState("");
@@ -303,6 +341,8 @@ function App() {
   const [embeddedPlayer, setEmbeddedPlayer] = useState(emptyEmbeddedPlayerState);
   const [viewMode, setViewMode] = useState("browse");
   const [playbackBackVisible, setPlaybackBackVisible] = useState(false);
+  const [currentPlaybackStreamer, setCurrentPlaybackStreamer] = useState(null);
+  const [danmakuItems, setDanmakuItems] = useState([]);
   const playerSurfaceRef = useRef(null);
   const boundsFrameRef = useRef(0);
   const lastBoundsRef = useRef("");
@@ -311,8 +351,13 @@ function App() {
   const playbackOriginRef = useRef({ activeTab: "favorites", scrollY: 0 });
   const restoreScrollRef = useRef(null);
   const playbackBackHideTimerRef = useRef(0);
+  const playbackPointerPositionRef = useRef({ x: null, y: null });
   const playbackExitInFlightRef = useRef(false);
   const playbackAwaitingStartRef = useRef(false);
+  const danmakuSocketRef = useRef(null);
+  const danmakuTimersRef = useRef(new Map());
+  const danmakuRowAvailabilityRef = useRef([]);
+  const danmakuNextIdRef = useRef(1);
 
   function clearPlaybackBackHideTimer() {
     if (playbackBackHideTimerRef.current) {
@@ -321,9 +366,109 @@ function App() {
     }
   }
 
+  function schedulePlaybackBackHide() {
+    clearPlaybackBackHideTimer();
+    playbackBackHideTimerRef.current = window.setTimeout(() => {
+      setPlaybackBackVisible(false);
+      playbackBackHideTimerRef.current = 0;
+    }, PLAYBACK_BACK_HIDE_DELAY_MS);
+  }
+
+  function normalizeDanmakuFontSize(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return DEFAULT_DANMAKU_FONT_SIZE;
+    }
+    return Math.min(28, Math.max(9, Math.round(parsed)));
+  }
+
+  function clearDanmakuTimers() {
+    for (const timer of danmakuTimersRef.current.values()) {
+      window.clearTimeout(timer);
+    }
+    danmakuTimersRef.current.clear();
+  }
+
+  function clearDanmakuState() {
+    clearDanmakuTimers();
+    danmakuRowAvailabilityRef.current = [];
+    setDanmakuItems([]);
+  }
+
+  function removeDanmakuItem(id) {
+    const timer = danmakuTimersRef.current.get(id);
+    if (timer) {
+      window.clearTimeout(timer);
+      danmakuTimersRef.current.delete(id);
+    }
+    setDanmakuItems(current => current.filter(item => item.id !== id));
+  }
+
+  function enqueueDanmaku(text) {
+    const content = text.trim();
+    if (!content) {
+      return;
+    }
+
+    const danmakuFontSize = normalizeDanmakuFontSize(settings.danmakuFontSize);
+    const danmakuRowHeight = danmakuFontSize + 12;
+    const stageHeight = playerSurfaceRef.current?.clientHeight || window.innerHeight || 720;
+    const availableHeight = Math.max(
+      danmakuRowHeight,
+      stageHeight - DANMAKU_TOP_PADDING - DANMAKU_BOTTOM_PADDING,
+    );
+    const rowCount = Math.max(4, Math.floor(availableHeight / danmakuRowHeight));
+    const now = performance.now();
+    const rowAvailability = danmakuRowAvailabilityRef.current;
+
+    while (rowAvailability.length < rowCount) {
+      rowAvailability.push(0);
+    }
+
+    let rowIndex = 0;
+    let earliestAvailable = rowAvailability[0] || 0;
+    for (let index = 0; index < rowCount; index += 1) {
+      const availableAt = rowAvailability[index] || 0;
+      if (availableAt <= now) {
+        rowIndex = index;
+        earliestAvailable = availableAt;
+        break;
+      }
+      if (availableAt < earliestAvailable) {
+        rowIndex = index;
+        earliestAvailable = availableAt;
+      }
+    }
+
+    const gapMs = 900 + Math.min(2200, content.length * 55);
+    rowAvailability[rowIndex] = Math.max(now, earliestAvailable) + gapMs;
+
+    const durationMs = Math.min(14000, Math.max(9000, 8200 + content.length * 85));
+    const item = {
+      id: danmakuNextIdRef.current,
+      text: content,
+      top: DANMAKU_TOP_PADDING + rowIndex * danmakuRowHeight,
+      durationMs,
+    };
+    danmakuNextIdRef.current += 1;
+
+    setDanmakuItems(current => {
+      const next = [...current, item];
+      return next.length > 80 ? next.slice(next.length - 80) : next;
+    });
+
+    const timer = window.setTimeout(() => {
+      removeDanmakuItem(item.id);
+    }, durationMs + 260);
+    danmakuTimersRef.current.set(item.id, timer);
+  }
+
   function restoreBrowseView() {
     playbackAwaitingStartRef.current = false;
     clearPlaybackBackHideTimer();
+    playbackPointerPositionRef.current = { x: null, y: null };
+    clearDanmakuState();
+    setCurrentPlaybackStreamer(null);
     setPlaybackBackVisible(false);
     setViewMode("browse");
     setActiveTab(playbackOriginRef.current.activeTab);
@@ -335,11 +480,23 @@ function App() {
       return;
     }
     setPlaybackBackVisible(true);
-    clearPlaybackBackHideTimer();
-    playbackBackHideTimerRef.current = window.setTimeout(() => {
-      setPlaybackBackVisible(false);
-      playbackBackHideTimerRef.current = 0;
-    }, PLAYBACK_BACK_HIDE_DELAY_MS);
+    schedulePlaybackBackHide();
+  }
+
+  function handlePlaybackPointerMove(event) {
+    if (viewMode !== "playback") {
+      return;
+    }
+
+    const nextX = Number(event.clientX);
+    const nextY = Number(event.clientY);
+    const lastPosition = playbackPointerPositionRef.current;
+    if (lastPosition.x === nextX && lastPosition.y === nextY) {
+      return;
+    }
+
+    playbackPointerPositionRef.current = { x: nextX, y: nextY };
+    revealPlaybackBackButton();
   }
 
   function enterPlaybackView() {
@@ -350,6 +507,7 @@ function App() {
     };
     restoreScrollRef.current = null;
     clearPlaybackBackHideTimer();
+    playbackPointerPositionRef.current = { x: null, y: null };
     setPlaybackBackVisible(false);
     setViewMode("playback");
     window.scrollTo(0, 0);
@@ -391,7 +549,11 @@ function App() {
         }
 
         unlistenUpdated = await listen("bilibili-login-updated", event => {
-          setSettings(event.payload);
+          setSettings(current => ({
+            ...current,
+            ...event.payload,
+            danmakuFontSize: normalizeDanmakuFontSize(event.payload?.danmakuFontSize),
+          }));
           setMessage("已更新 B站 登录态");
           setError("");
         });
@@ -412,7 +574,10 @@ function App() {
         ]);
 
         if (!cancelled) {
-          setSettings(savedSettings);
+          setSettings({
+            ...savedSettings,
+            danmakuFontSize: normalizeDanmakuFontSize(savedSettings.danmakuFontSize),
+          });
           setEmbeddedPlayer(embeddedState);
           if (savedStreamers.length > 0) {
             const syncedStreamers = await invoke("sync_streamers_status", { streamers: savedStreamers });
@@ -447,26 +612,14 @@ function App() {
   useEffect(() => {
     return () => {
       clearPlaybackBackHideTimer();
+      clearDanmakuState();
+      const socket = danmakuSocketRef.current;
+      danmakuSocketRef.current = null;
+      if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+        socket.close();
+      }
     };
   }, []);
-
-  useEffect(() => {
-    if (settings.player === "libmpv") {
-      return;
-    }
-
-    if (viewMode === "playback") {
-      restoreBrowseView();
-    }
-
-    if (!embeddedPlayer.visible && embeddedPlayer.phase === "idle") {
-      return;
-    }
-
-    invoke("embedded_player_command", {
-      command: { kind: "stop" },
-    }).catch(() => {});
-  }, [settings.player, embeddedPlayer.phase, embeddedPlayer.visible, viewMode]);
 
   useEffect(() => {
     if (viewMode !== "browse" || restoreScrollRef.current == null) {
@@ -555,8 +708,84 @@ function App() {
   }, [viewMode, embeddedPlayer.phase, embeddedPlayer.visible, embeddedPlayer.errorMessage]);
 
   useEffect(() => {
+    const target = currentPlaybackStreamer?.target?.trim();
+    if (viewMode !== "playback" || !target) {
+      const socket = danmakuSocketRef.current;
+      danmakuSocketRef.current = null;
+      if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+        socket.close();
+      }
+      clearDanmakuState();
+      return undefined;
+    }
+
+    clearDanmakuState();
+    let cancelled = false;
+    let socket;
+
+    async function connectDanmaku() {
+      try {
+        const port = await invoke("ensure_danmaku_server");
+        if (cancelled) {
+          return;
+        }
+
+        socket = new WebSocket(`ws://127.0.0.1:${port}/danmaku-websocket`);
+        danmakuSocketRef.current = socket;
+
+        socket.addEventListener("open", () => {
+          if (cancelled || socket.readyState !== WebSocket.OPEN) {
+            return;
+          }
+          socket.send(target);
+        });
+
+        socket.addEventListener("message", event => {
+          if (cancelled || typeof event.data !== "string") {
+            return;
+          }
+          const { kind, texts } = parseDanmakuPayload(event.data);
+          for (const text of texts) {
+            if (kind === "error") {
+              setError(text);
+              continue;
+            }
+            if (kind !== "chat") {
+              continue;
+            }
+            enqueueDanmaku(text);
+          }
+        });
+
+        socket.addEventListener("error", () => {
+          if (!cancelled) {
+            setError("连接本地弹幕服务失败");
+          }
+        });
+      } catch (err) {
+        if (!cancelled) {
+          setError(`启动弹幕服务失败：${String(err)}`);
+        }
+      }
+    }
+
+    void connectDanmaku();
+
+    return () => {
+      cancelled = true;
+      if (danmakuSocketRef.current === socket) {
+        danmakuSocketRef.current = null;
+      }
+      if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+        socket.close();
+      }
+      clearDanmakuState();
+    };
+  }, [viewMode, currentPlaybackStreamer?.target]);
+
+  useEffect(() => {
     const element = playerSurfaceRef.current;
-    const shouldTrack = settings.player === "libmpv" && viewMode === "playback";
+    const shouldTrack = viewMode === "playback";
     if (!element || !shouldTrack) {
       return undefined;
     }
@@ -628,7 +857,7 @@ function App() {
       boundsRequestInFlightRef.current = false;
       lastBoundsRef.current = "";
     };
-  }, [settings.player, viewMode]);
+  }, [viewMode]);
 
   async function persistStreamers(nextStreamers, nextMessage = "主播列表已保存") {
     setSaving(true);
@@ -647,16 +876,23 @@ function App() {
     }
   }
 
-  async function persistSettings(nextSettings) {
+  async function persistSettings(nextSettings, nextMessage = "设置已保存") {
     setSaving(true);
     setError("");
     setMessage("");
     try {
-      const saved = await invoke("save_settings", { settings: nextSettings });
+      const saved = await invoke("save_settings", {
+        settings: {
+          ...nextSettings,
+          danmakuFontSize: normalizeDanmakuFontSize(nextSettings.danmakuFontSize),
+        },
+      });
       setSettings(saved);
-      setMessage("播放器设置已保存");
+      setMessage(nextMessage);
+      return saved;
     } catch (err) {
       setError(String(err));
+      return null;
     } finally {
       setSaving(false);
     }
@@ -679,7 +915,10 @@ function App() {
     setMessage("");
     try {
       const saved = await invoke("clear_bilibili_login");
-      setSettings(saved);
+      setSettings({
+        ...saved,
+        danmakuFontSize: normalizeDanmakuFontSize(saved.danmakuFontSize),
+      });
       setMessage("已清除 B站 登录态");
     } catch (err) {
       setError(String(err));
@@ -804,27 +1043,25 @@ function App() {
     setError("");
     setMessage("");
     try {
-      if (settings.player === "libmpv") {
-        enterPlaybackView();
-      }
+      const playbackStreamer = {
+        id: streamer.id || crypto.randomUUID(),
+        name: streamer.name,
+        platform: streamer.platform || "douyu",
+        target: streamer.target,
+        avatarUrl: streamer.avatarUrl || null,
+        isOnline: streamer.isOnline ?? false,
+        screenshotUrl: streamer.screenshotUrl || null,
+        heatText: streamer.heatText || null,
+      };
+      setCurrentPlaybackStreamer(playbackStreamer);
+      enterPlaybackView();
       await new Promise(resolve => requestAnimationFrame(() => resolve()));
       await invoke("play_streamer", {
-        streamer: {
-          id: streamer.id || crypto.randomUUID(),
-          name: streamer.name,
-          platform: streamer.platform || "douyu",
-          target: streamer.target,
-          avatarUrl: streamer.avatarUrl || null,
-          isOnline: streamer.isOnline ?? false,
-          screenshotUrl: streamer.screenshotUrl || null,
-          heatText: streamer.heatText || null,
-        },
+        streamer: playbackStreamer,
         settings,
       });
     } catch (err) {
-      if (settings.player === "libmpv") {
-        restoreBrowseView();
-      }
+      restoreBrowseView();
       setError(String(err));
     }
   }
@@ -842,10 +1079,12 @@ function App() {
       <PlaybackPage
         surfaceRef={playerSurfaceRef}
         backButtonVisible={playbackBackVisible}
+        danmakuItems={danmakuItems}
+        danmakuFontSize={normalizeDanmakuFontSize(settings.danmakuFontSize)}
         onBack={() => {
           void exitPlaybackView({ stopPlayback: true });
         }}
-        onPointerMove={revealPlaybackBackButton}
+        onPointerMove={handlePlaybackPointerMove}
       />
     );
   }
@@ -1006,57 +1245,37 @@ function App() {
             <div className="sub-panel-head">
               <h3>播放器设置</h3>
             </div>
-            <div className="player-picker" role="tablist" aria-label="播放器类型">
-              <button
-                type="button"
-                className={`player-picker-button ${settings.player === "iina" ? "active" : ""}`}
-                onClick={() => setSettings(current => ({ ...current, player: "iina" }))}
-              >
-                IINA
-              </button>
-              <button
-                type="button"
-                className={`player-picker-button ${settings.player === "mpv" ? "active" : ""}`}
-                onClick={() => setSettings(current => ({ ...current, player: "mpv" }))}
-              >
-                mpv
-              </button>
-              <button
-                type="button"
-                className={`player-picker-button ${settings.player === "libmpv" ? "active" : ""}`}
-                onClick={() => setSettings(current => ({ ...current, player: "libmpv" }))}
-              >
-                libmpv
-              </button>
-            </div>
-            <div className={`player-settings ${settings.player === "libmpv" ? "single-action" : ""}`}>
-              {settings.player === "libmpv" ? (
-                <div className="player-inline-note">
-                  <strong>主窗口内嵌播放已启用。</strong>
-                  <span>该模式依赖系统已安装 `libmpv`，首版暂不启用弹幕。</span>
+            <div className="player-extra">
+              <label className="setting-stack" htmlFor="danmaku-font-size">
+                <div className="setting-label-row">
+                  <span>弹幕字号</span>
+                  <strong>{normalizeDanmakuFontSize(settings.danmakuFontSize)}px</strong>
                 </div>
-              ) : (
-                <label className="search-field">
-                  <input
-                    value={settings.player === "iina" ? settings.iinaPath : settings.mpvPath}
-                    onChange={event =>
-                      setSettings(current => (
-                        settings.player === "iina"
-                          ? { ...current, iinaPath: event.target.value }
-                          : { ...current, mpvPath: event.target.value }
-                      ))
-                    }
-                    placeholder={
-                      settings.player === "iina"
-                        ? "IINA.app 或 iina-cli 路径 留空则自动查找"
-                        : "mpv 路径 留空则使用系统 PATH 中的 mpv"
-                    }
-                  />
-                </label>
-              )}
-              <button type="button" className="ghost-button" disabled={saving} onClick={() => persistSettings(settings)}>
-                保存
-              </button>
+                <input
+                  id="danmaku-font-size"
+                  type="range"
+                  min="9"
+                  max="28"
+                  step="1"
+                  value={normalizeDanmakuFontSize(settings.danmakuFontSize)}
+                  onChange={event =>
+                    setSettings(current => ({
+                      ...current,
+                      danmakuFontSize: normalizeDanmakuFontSize(event.target.value),
+                    }))
+                  }
+                />
+              </label>
+              <div className="settings-actions">
+                <button
+                  type="button"
+                  className="ghost-button"
+                  disabled={saving}
+                  onClick={() => persistSettings(settings, "弹幕字号已保存")}
+                >
+                  保存字号
+                </button>
+              </div>
             </div>
             <div className="player-extra">
               <div className="login-status-row compact">
@@ -1073,37 +1292,6 @@ function App() {
                 </div>
               </div>
             </div>
-            {settings.player === "iina" ? (
-              <div className="player-extra">
-                <label className="toggle-row">
-                  <input
-                    type="checkbox"
-                    checked={settings.enableIinaDanmaku}
-                    onChange={event =>
-                      setSettings(current => ({ ...current, enableIinaDanmaku: event.target.checked }))
-                    }
-                  />
-                  <span>启用 IINA 弹幕</span>
-                </label>
-                <p className="settings-hint">
-                  当前 IINA 弹幕支持斗鱼、B站、虎牙、抖音。
-                </p>
-                <p className="settings-hint">
-                  B站高画质通常需要登录态。可以直接用上面的登录面板完成登录。
-                </p>
-              </div>
-            ) : settings.player === "libmpv" ? (
-              <div className="player-extra">
-                <p className="settings-hint">
-                  libmpv 模式会把画面直接嵌入主窗口，并沿用当前直播提流与备用线路逻辑。
-                </p>
-                <p className="settings-hint">
-                  如果系统缺少 `libmpv` 或播放异常，可以随时切回 IINA / mpv 外部模式。
-                </p>
-              </div>
-            ) : (
-              <p className="settings-hint">mpv 模式当前不启用弹幕。B站高画质同样可以使用上面的登录面板。</p>
-            )}
           </div>
         </section>
       )}

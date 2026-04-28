@@ -39,7 +39,6 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "resources/iina-plugin-danmaku",
       "resources/bilibili_icon.ico",
       "resources/douyin.js",
       "resources/douyin_frontier_sign.js",
@@ -50,8 +49,7 @@
       "resources/huya.js",
       "resources/huya_icon.ico",
       "../douyu_extract_playurl.js",
-      "../douyu_search_streamers.js",
-      "../douyu_to_mpv.py"
+      "../douyu_search_streamers.js"
     ]
   }
 }

@@ -67,6 +67,10 @@ fn default_streamer_platform() -> String {
     PLATFORM_DOUYU.to_string()
 }
 
+fn default_danmaku_font_size() -> u32 {
+    18
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Streamer {
@@ -89,6 +93,8 @@ struct Settings {
     mpv_path: String,
     bilibili_cookie: String,
     enable_iina_danmaku: bool,
+    #[serde(default = "default_danmaku_font_size")]
+    danmaku_font_size: u32,
 }
 
 impl Default for Settings {
@@ -99,6 +105,7 @@ impl Default for Settings {
             mpv_path: String::new(),
             bilibili_cookie: String::new(),
             enable_iina_danmaku: true,
+            danmaku_font_size: default_danmaku_font_size(),
         }
     }
 }
@@ -179,8 +186,10 @@ struct DanmakuCommentPayload {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DanmakuEventPayload {
     method: String,
+    kind: String,
     dms: Vec<DanmakuCommentPayload>,
 }
 
@@ -402,12 +411,14 @@ struct BilibiliRoomBaseInfo {
 #[derive(Debug, Clone, Deserialize)]
 struct HuyaProfileRoomResponse {
     data: HuyaProfileRoomData,
-    #[serde(default, rename = "liveStatus")]
-    live_status: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct HuyaProfileRoomData {
+    #[serde(default, rename = "liveStatus")]
+    live_status: String,
+    #[serde(default, rename = "realLiveStatus")]
+    real_live_status: String,
     #[serde(default, rename = "liveData")]
     live_data: HuyaLiveData,
     #[serde(default)]
@@ -557,15 +568,7 @@ fn douyin_client() -> Result<Client, String> {
 }
 
 fn default_player() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "iina"
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        "mpv"
-    }
+    "libmpv"
 }
 
 fn normalize_platform(platform: &str) -> &'static str {
@@ -699,9 +702,10 @@ fn extract_douyin_room_id(target: &str) -> Option<String> {
     None
 }
 
-fn danmaku_text_event(text: impl Into<String>) -> Result<String, String> {
+fn danmaku_text_event(kind: &str, text: impl Into<String>) -> Result<String, String> {
     let event = DanmakuEventPayload {
         method: "sendDM".to_string(),
+        kind: kind.to_string(),
         dms: vec![DanmakuCommentPayload { text: text.into() }],
     };
     serde_json::to_string(&event).map_err(|err| err.to_string())
@@ -938,6 +942,11 @@ fn build_bilibili_cookie_header(raw_cookie: &str) -> Result<Option<HeaderValue>,
     let header = cookies.join("; ");
     let value = HeaderValue::from_str(&header).map_err(|err| err.to_string())?;
     Ok(Some(value))
+}
+
+pub(crate) fn build_bilibili_cookie_string(raw_cookie: &str) -> Result<Option<String>, String> {
+    Ok(build_bilibili_cookie_header(raw_cookie)?
+        .and_then(|value| value.to_str().ok().map(ToOwned::to_owned)))
 }
 
 fn fetch_bilibili_search(keyword: &str) -> Result<Vec<BilibiliLiveSearchItem>, String> {
@@ -1394,11 +1403,17 @@ fn huya_title(data: &HuyaLiveData) -> String {
     }
 }
 
+fn is_huya_room_online(data: &HuyaProfileRoomData) -> bool {
+    let live_status = data.live_status.trim().to_ascii_uppercase();
+    let real_live_status = data.real_live_status.trim().to_ascii_uppercase();
+    live_status == "ON" || real_live_status == "ON"
+}
+
 fn fetch_huya_room_state(target: &str) -> Result<ExtractResult, String> {
     let room_id = resolve_huya_room_id(target)?;
     let response = fetch_huya_profile_room(&room_id)?;
+    let is_online = is_huya_room_online(&response.data);
     let live_data = response.data.live_data;
-    let is_online = response.live_status == "ON";
 
     Ok(ExtractResult {
         platform: PLATFORM_HUYA.to_string(),
@@ -2019,12 +2034,28 @@ fn settings_file(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn load_settings_inner(app: &AppHandle) -> Result<Settings, String> {
     let path = settings_file(app)?;
-    read_json_or_default(&path)
+    let mut settings: Settings = read_json_or_default(&path)?;
+    settings.player = default_player().to_string();
+    settings.iina_path.clear();
+    settings.mpv_path.clear();
+    settings.enable_iina_danmaku = false;
+    settings.danmaku_font_size = normalize_danmaku_font_size(settings.danmaku_font_size);
+    Ok(settings)
 }
 
 fn save_settings_inner(app: &AppHandle, settings: &Settings) -> Result<(), String> {
     let path = settings_file(app)?;
-    write_json(&path, settings)
+    let mut normalized = settings.clone();
+    normalized.player = default_player().to_string();
+    normalized.iina_path.clear();
+    normalized.mpv_path.clear();
+    normalized.enable_iina_danmaku = false;
+    normalized.danmaku_font_size = normalize_danmaku_font_size(normalized.danmaku_font_size);
+    write_json(&path, &normalized)
+}
+
+fn normalize_danmaku_font_size(value: u32) -> u32 {
+    value.clamp(9, 28)
 }
 
 fn has_bilibili_login(cookie: &str) -> bool {
@@ -2200,19 +2231,16 @@ fn write_playlist(title: &str, urls: &[String]) -> Result<PathBuf, String> {
 }
 
 fn normalize_player(settings: &Settings) -> String {
-    let player = settings.player.trim().to_lowercase();
-    if player.is_empty() {
-        default_player().to_string()
-    } else if matches!(player.as_str(), "iina" | "mpv" | "libmpv") {
-        player
-    } else {
-        default_player().to_string()
-    }
+    let _ = settings;
+    default_player().to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{default_player, normalize_player, Settings};
+    use super::{
+        default_player, is_huya_room_online, normalize_danmaku_font_size, normalize_player,
+        HuyaProfileRoomResponse, Settings,
+    };
 
     #[test]
     fn normalize_player_accepts_libmpv() {
@@ -2225,13 +2253,37 @@ mod tests {
     }
 
     #[test]
-    fn normalize_player_falls_back_for_unknown_values() {
+    fn normalize_player_forces_libmpv_for_legacy_values() {
         let settings = Settings {
-            player: "vlc".to_string(),
+            player: "iina".to_string(),
             ..Settings::default()
         };
 
         assert_eq!(normalize_player(&settings), default_player());
+    }
+
+    #[test]
+    fn normalize_danmaku_font_size_clamps_to_supported_range() {
+        assert_eq!(normalize_danmaku_font_size(6), 9);
+        assert_eq!(normalize_danmaku_font_size(18), 18);
+        assert_eq!(normalize_danmaku_font_size(72), 28);
+    }
+
+    #[test]
+    fn parses_huya_nested_live_status() {
+        let response: HuyaProfileRoomResponse = serde_json::from_value(serde_json::json!({
+            "data": {
+                "liveStatus": "ON",
+                "realLiveStatus": "ON",
+                "liveData": {
+                    "nick": "测试主播",
+                    "profileRoom": 8826
+                }
+            }
+        }))
+        .expect("huya response should deserialize");
+
+        assert!(is_huya_room_online(&response.data));
     }
 }
 
@@ -2905,46 +2957,6 @@ fn patch_xjbeta_plugin_visibility_behavior() -> Result<(), String> {
     }
 }
 
-fn is_iina_running() -> bool {
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("pgrep")
-            .arg("-x")
-            .arg("IINA")
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-}
-
-fn restart_iina_if_needed() -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let status = Command::new("osascript")
-            .arg("-e")
-            .arg("tell application \"IINA\" to quit")
-            .status()
-            .map_err(|err| format!("重启 IINA 失败：{err}"))?;
-
-        if !status.success() {
-            return Err("重启 IINA 失败。".to_string());
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(900));
-        Ok(())
-    }
-}
-
 fn open_iina_playlist_cli(
     iina_cli: &str,
     playlist_path: &Path,
@@ -3008,7 +3020,7 @@ fn open_iina_playlist(
     }
 
     if enable_danmaku {
-        let danmaku_port = ensure_danmaku_server(app)?;
+        let danmaku_port = ensure_danmaku_server_running(app)?;
         let args_hex = build_iina_plus_args(data, media_title, danmaku_port)?;
         if open_iina_plugin_url_scheme(&args_hex, danmaku_port).is_err() {
             let mut command = Command::new(&iina_cli);
@@ -3067,7 +3079,7 @@ fn open_mpv_playlist(
     Ok(())
 }
 
-fn ensure_danmaku_server(app: &AppHandle) -> Result<u16, String> {
+fn ensure_danmaku_server_running(app: &AppHandle) -> Result<u16, String> {
     let state = app.state::<Arc<DanmakuServerState>>();
     if state.started.swap(true, Ordering::SeqCst) {
         return Ok(state.port);
@@ -3193,6 +3205,7 @@ async fn proxy_douyin_danmaku(
 
     client_stream
         .send(AxumMessage::Text(danmaku_text_event(
+            "status",
             "Stream Hub 弹幕已连接",
         )?))
         .await
@@ -3215,7 +3228,7 @@ async fn proxy_douyin_danmaku(
                         let batch = decode_douyin_danmaku_batch(&data)?;
                         for text in batch.comments {
                             if client_stream
-                                .send(AxumMessage::Text(danmaku_text_event(text)?))
+                                .send(AxumMessage::Text(danmaku_text_event("chat", text)?))
                                 .await
                                 .is_err()
                             {
@@ -3250,6 +3263,7 @@ async fn proxy_live_danmaku(
 ) -> Result<(), String> {
     client_stream
         .send(AxumMessage::Text(danmaku_text_event(
+            "status",
             "Stream Hub 本地弹幕服务已连接",
         )?))
         .await
@@ -3284,6 +3298,7 @@ async fn proxy_live_danmaku(
     if room_id.is_empty() {
         let _ = client_stream
             .send(AxumMessage::Text(danmaku_text_event(
+                "error",
                 "Stream Hub 未能解析房间号",
             )?))
             .await;
@@ -3317,9 +3332,11 @@ async fn proxy_live_danmaku(
         };
 
         let outgoing = match event.event_type.as_str() {
-            "status" => danmaku_text_event(event.text)?,
-            "chat" => danmaku_text_event(event.text)?,
-            "error" => danmaku_text_event(format!("Stream Hub 弹幕桥接失败: {}", event.text))?,
+            "status" => danmaku_text_event("status", event.text)?,
+            "chat" => danmaku_text_event("chat", event.text)?,
+            "error" => {
+                danmaku_text_event("error", format!("Stream Hub 弹幕桥接失败: {}", event.text))?
+            }
             _ => continue,
         };
 
@@ -3827,19 +3844,6 @@ fn load_platform_icons(app: AppHandle) -> Result<PlatformIcons, String> {
 }
 
 #[tauri::command]
-fn install_iina_danmaku_plugin(app: AppHandle) -> Result<String, String> {
-    let _ = app;
-    enable_iina_plugin_system()?;
-    enable_xjbeta_iina_plugin()?;
-    if is_iina_running() {
-        restart_iina_if_needed()?;
-        Ok("已启用 IINA 弹幕插件并重启 IINA。".to_string())
-    } else {
-        Ok("已启用 IINA 弹幕插件。".to_string())
-    }
-}
-
-#[tauri::command]
 fn resolve_streamer(app: AppHandle, target: String) -> Result<ResolvedStreamer, String> {
     let parsed = fetch_room_state_for_platform_with_app(
         Some(&app),
@@ -4140,6 +4144,11 @@ fn embedded_player_set_bounds(
 }
 
 #[tauri::command]
+fn ensure_danmaku_server(app: AppHandle) -> Result<u16, String> {
+    ensure_danmaku_server_running(&app)
+}
+
+#[tauri::command]
 fn embedded_player_get_state(app: AppHandle) -> Result<player::EmbeddedPlayerSnapshot, String> {
     Ok(app.state::<player::EmbeddedPlayerManager>().get_state())
 }
@@ -4177,12 +4186,12 @@ pub fn run() {
             open_bilibili_login,
             refresh_bilibili_login,
             clear_bilibili_login,
-            install_iina_danmaku_plugin,
             resolve_streamer,
             search_streamers,
             search_streamers_by_platform,
             sync_streamers_status,
             play_streamer,
+            ensure_danmaku_server,
             embedded_player_set_bounds,
             embedded_player_get_state,
             embedded_player_command
