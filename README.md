@@ -2,7 +2,7 @@
 
 Stream Hub 是一个基于 `Tauri + React + libmpv` 的桌面直播聚合播放器，用来收藏、搜索并在应用内播放常看的直播间。
 
-![Stream Hub 主界面截图](docs/screenshot.png)
+![Stream Hub 播放演示](docs/screenrecord.gif)
 
 ## 功能特性
 
