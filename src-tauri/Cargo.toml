@@ -1,6 +1,6 @@
 [package]
 name = "stream-hub"
-version = "0.1.1"
+version = "0.1.2"
 description = "Stream Hub desktop app"
 authors = ["liushihao"]
 edition = "2021"

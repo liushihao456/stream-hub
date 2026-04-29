@@ -107,7 +107,7 @@ jobs:
           npm config set replace-registry-host always
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Build installer
         run: npm run tauri:build -- --bundles ${{ matrix.bundles }} --ci
