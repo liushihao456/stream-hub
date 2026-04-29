@@ -7,9 +7,10 @@ use libmpv_sys::{
     mpv_event_id_MPV_EVENT_PLAYBACK_RESTART, mpv_event_id_MPV_EVENT_SHUTDOWN,
     mpv_event_id_MPV_EVENT_START_FILE, mpv_event_id_MPV_EVENT_UNPAUSE, mpv_event_log_message,
     mpv_format_MPV_FORMAT_DOUBLE, mpv_format_MPV_FORMAT_FLAG, mpv_format_MPV_FORMAT_INT64,
-    mpv_format_MPV_FORMAT_STRING, mpv_get_property, mpv_handle, mpv_initialize,
-    mpv_request_log_messages, mpv_set_option, mpv_set_option_string, mpv_set_property,
-    mpv_wait_event,
+    mpv_format_MPV_FORMAT_NODE, mpv_format_MPV_FORMAT_NODE_ARRAY, mpv_format_MPV_FORMAT_NODE_MAP,
+    mpv_format_MPV_FORMAT_STRING, mpv_free_node_contents, mpv_get_property, mpv_handle,
+    mpv_initialize, mpv_node, mpv_request_log_messages, mpv_set_option, mpv_set_option_string,
+    mpv_set_property, mpv_wait_event,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,6 +46,9 @@ const MPV_EVENT_IDLE: u32 = mpv_event_id_MPV_EVENT_IDLE;
 const MPV_EVENT_END_FILE: u32 = mpv_event_id_MPV_EVENT_END_FILE;
 const MPV_EVENT_SHUTDOWN: u32 = mpv_event_id_MPV_EVENT_SHUTDOWN;
 const MPV_EVENT_LOG_MESSAGE: u32 = mpv_event_id_MPV_EVENT_LOG_MESSAGE;
+const LIVE_CACHE_WINDOW_SECONDS: f64 = 300.0;
+const LIVE_EDGE_TOLERANCE_SECONDS: f64 = 2.5;
+const LIVE_EDGE_SEEK_SAFETY_SECONDS: f64 = 5.0;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +61,14 @@ pub struct EmbeddedPlayerSnapshot {
     paused: bool,
     muted: bool,
     volume: f64,
+    position_seconds: f64,
+    duration_seconds: f64,
+    seekable: bool,
+    live_cache_seekable: bool,
+    live_cache_start_seconds: f64,
+    live_cache_end_seconds: f64,
+    live_cache_window_seconds: f64,
+    is_at_live_edge: bool,
     using_external_player: bool,
     error_message: String,
 }
@@ -72,6 +84,14 @@ impl Default for EmbeddedPlayerSnapshot {
             paused: false,
             muted: false,
             volume: 100.0,
+            position_seconds: 0.0,
+            duration_seconds: 0.0,
+            seekable: false,
+            live_cache_seekable: false,
+            live_cache_start_seconds: 0.0,
+            live_cache_end_seconds: 0.0,
+            live_cache_window_seconds: 0.0,
+            is_at_live_edge: false,
             using_external_player: false,
             error_message: String::new(),
         }
@@ -132,6 +152,18 @@ struct LastLoadDebug {
     url_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SeekableRange {
+    start: f64,
+    end: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LiveCacheWindow {
+    start: f64,
+    end: f64,
+}
+
 impl EmbeddedPlayerManager {
     pub fn new() -> Self {
         Self {
@@ -148,11 +180,11 @@ impl EmbeddedPlayerManager {
     }
 
     pub fn get_state(&self) -> EmbeddedPlayerSnapshot {
-        self.inner
-            .lock()
-            .expect("embedded player state poisoned")
-            .snapshot
-            .clone()
+        let mut state = self.inner.lock().expect("embedded player state poisoned");
+        if let Some(ctx) = state.backend.as_ref().map(MpvBackend::ctx_ptr) {
+            refresh_snapshot_from_mpv(&mut state.snapshot, ctx);
+        }
+        state.snapshot.clone()
     }
 
     pub fn set_bounds(
@@ -198,6 +230,7 @@ impl EmbeddedPlayerManager {
             state.snapshot.streamer_name = data.streamer_name.clone();
             state.snapshot.platform = data.platform.clone();
             state.snapshot.visible = true;
+            reset_playback_timing(&mut state.snapshot);
             state.snapshot.error_message.clear();
             let last_bounds = state.last_bounds.clone();
             let ctx = {
@@ -301,6 +334,7 @@ impl EmbeddedPlayerManager {
             let Some(ctx) = state.backend.as_ref().map(MpvBackend::ctx_ptr) else {
                 return Ok(state.snapshot.clone());
             };
+            refresh_snapshot_from_mpv(&mut state.snapshot, ctx);
             match command {
                 ParsedCommand::TogglePause => {
                     run_mpv_command(ctx, &["cycle", "pause"])?;
@@ -309,6 +343,7 @@ impl EmbeddedPlayerManager {
                     state.snapshot.visible = false;
                     state.snapshot.phase = "idle".to_string();
                     state.snapshot.paused = false;
+                    reset_playback_timing(&mut state.snapshot);
                     if let Some(backend) = state.backend.as_mut() {
                         backend.host.set_visible(app, false)?;
                     }
@@ -319,6 +354,39 @@ impl EmbeddedPlayerManager {
                 }
                 ParsedCommand::SetVolume(value) => {
                     set_mpv_double_property(ctx, "volume", value)?;
+                }
+                ParsedCommand::SeekBy(offset) => {
+                    if let Some(target) = live_cache_seek_by_target(&state.snapshot, offset) {
+                        run_live_cache_seek(ctx, target)?;
+                    } else if state.snapshot.seekable {
+                        run_mpv_command_dynamic(
+                            ctx,
+                            &[
+                                "seek".to_string(),
+                                format!("{offset:.3}"),
+                                "relative+exact".to_string(),
+                            ],
+                        )?;
+                    }
+                }
+                ParsedCommand::SeekTo(position) => {
+                    if let Some(target) = clamp_to_live_cache_window(&state.snapshot, position) {
+                        run_live_cache_seek(ctx, target)?;
+                    } else if state.snapshot.seekable {
+                        let target = if state.snapshot.duration_seconds > 0.0 {
+                            position.clamp(0.0, state.snapshot.duration_seconds)
+                        } else {
+                            position.max(0.0)
+                        };
+                        run_mpv_command_dynamic(
+                            ctx,
+                            &[
+                                "seek".to_string(),
+                                format!("{target:.3}"),
+                                "absolute+exact".to_string(),
+                            ],
+                        )?;
+                    }
                 }
                 ParsedCommand::ReloadCurrent | ParsedCommand::SetFullscreen(_) => {}
             }
@@ -373,6 +441,7 @@ impl EmbeddedPlayerManager {
                     state.snapshot.phase = "idle".to_string();
                     state.snapshot.visible = false;
                     state.snapshot.paused = false;
+                    reset_playback_timing(&mut state.snapshot);
                     state.snapshot.error_message.clear();
                     state.snapshot.clone()
                 })
@@ -387,6 +456,7 @@ impl EmbeddedPlayerManager {
                     MPV_EVENT_START_FILE => {
                         state.snapshot.phase = "loading".to_string();
                         state.snapshot.visible = true;
+                        reset_playback_timing(&mut state.snapshot);
                     }
                     MPV_EVENT_FILE_LOADED | MPV_EVENT_PLAYBACK_RESTART => {
                         state.snapshot.phase = if state.snapshot.paused {
@@ -407,6 +477,7 @@ impl EmbeddedPlayerManager {
                     MPV_EVENT_IDLE => {
                         if !state.snapshot.visible {
                             state.snapshot.phase = "idle".to_string();
+                            reset_playback_timing(&mut state.snapshot);
                         }
                     }
                     MPV_EVENT_END_FILE => {
@@ -473,6 +544,8 @@ enum ParsedCommand {
     Stop,
     ToggleMute,
     SetVolume(f64),
+    SeekBy(f64),
+    SeekTo(f64),
     ReloadCurrent,
     SetFullscreen(bool),
 }
@@ -490,6 +563,21 @@ impl ParsedCommand {
                     .and_then(Value::as_f64)
                     .ok_or_else(|| "setVolume 需要数值 value".to_string())?
                     .clamp(0.0, 100.0),
+            )),
+            "seekBy" => Ok(Self::SeekBy(
+                payload
+                    .value
+                    .as_ref()
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| "seekBy 需要数值 value".to_string())?,
+            )),
+            "seekTo" => Ok(Self::SeekTo(
+                payload
+                    .value
+                    .as_ref()
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| "seekTo 需要数值 value".to_string())?
+                    .max(0.0),
             )),
             "reloadCurrent" => Ok(Self::ReloadCurrent),
             "setFullscreen" => Ok(Self::SetFullscreen(
@@ -516,6 +604,13 @@ fn create_mpv(_embed_id: isize) -> Result<*mut mpv_handle, String> {
     set_mpv_option_string(ctx, "input-vo-keyboard", "no")?;
     set_mpv_option_string(ctx, "ytdl", "no")?;
     set_mpv_option_string(ctx, "idle", "yes")?;
+    set_mpv_option_string(ctx, "cache", "yes")?;
+    set_mpv_option_string(ctx, "cache-secs", "300")?;
+    set_mpv_option_string(ctx, "demuxer-seekable-cache", "yes")?;
+    set_mpv_option_string(ctx, "force-seekable", "yes")?;
+    set_mpv_option_string(ctx, "demuxer-max-back-bytes", "512MiB")?;
+    set_mpv_option_string(ctx, "demuxer-max-bytes", "512MiB")?;
+    set_mpv_option_string(ctx, "demuxer-donate-buffer", "no")?;
 
     #[cfg(target_os = "macos")]
     set_mpv_option_string(ctx, "vo", "libmpv")?;
@@ -748,6 +843,63 @@ fn set_mpv_double_property(ctx: *mut mpv_handle, name: &str, value: f64) -> Resu
     }
 }
 
+fn reset_playback_timing(snapshot: &mut EmbeddedPlayerSnapshot) {
+    snapshot.position_seconds = 0.0;
+    snapshot.duration_seconds = 0.0;
+    snapshot.seekable = false;
+    reset_live_cache(snapshot);
+}
+
+fn reset_live_cache(snapshot: &mut EmbeddedPlayerSnapshot) {
+    snapshot.live_cache_seekable = false;
+    snapshot.live_cache_start_seconds = 0.0;
+    snapshot.live_cache_end_seconds = 0.0;
+    snapshot.live_cache_window_seconds = 0.0;
+    snapshot.is_at_live_edge = false;
+}
+
+fn clamp_to_live_cache_window(snapshot: &EmbeddedPlayerSnapshot, target: f64) -> Option<f64> {
+    if !snapshot.live_cache_seekable {
+        return None;
+    }
+
+    let start = snapshot.live_cache_start_seconds;
+    let end = snapshot.live_cache_end_seconds;
+    if !target.is_finite() || !start.is_finite() || !end.is_finite() || end <= start {
+        return None;
+    }
+
+    Some(clamp_live_cache_seek_target(start, end, target))
+}
+
+fn live_cache_seek_by_target(snapshot: &EmbeddedPlayerSnapshot, offset: f64) -> Option<f64> {
+    if !offset.is_finite() {
+        return None;
+    }
+    clamp_to_live_cache_window(snapshot, snapshot.position_seconds + offset)
+}
+
+fn clamp_live_cache_seek_target(start: f64, end: f64, target: f64) -> f64 {
+    target.clamp(start, end)
+}
+
+fn safe_live_cache_edge(start: f64, end: f64) -> f64 {
+    (end - LIVE_EDGE_SEEK_SAFETY_SECONDS).max(start)
+}
+
+fn run_live_cache_seek(ctx: *mut mpv_handle, target: f64) -> Result<(), String> {
+    run_mpv_command_dynamic(
+        ctx,
+        &[
+            "seek".to_string(),
+            format!("{target:.3}"),
+            "absolute+exact".to_string(),
+        ],
+    )?;
+    run_mpv_command(ctx, &["set", "pause", "no"])?;
+    Ok(())
+}
+
 fn refresh_snapshot_from_mpv(snapshot: &mut EmbeddedPlayerSnapshot, ctx: *mut mpv_handle) {
     if let Some(paused) = get_mpv_flag_property(ctx, "pause") {
         snapshot.paused = paused;
@@ -770,11 +922,188 @@ fn refresh_snapshot_from_mpv(snapshot: &mut EmbeddedPlayerSnapshot, ctx: *mut mp
         snapshot.volume = volume.clamp(0.0, 100.0);
     }
 
+    snapshot.position_seconds = get_mpv_double_property(ctx, "time-pos")
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0);
+    snapshot.duration_seconds = get_mpv_double_property(ctx, "duration")
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(0.0);
+    snapshot.seekable =
+        get_mpv_flag_property(ctx, "seekable").unwrap_or(false) && snapshot.duration_seconds > 0.0;
+
+    refresh_live_cache_snapshot(snapshot, ctx);
+
     if let Some(title) =
         get_mpv_string_property(ctx, "media-title").filter(|value| !value.is_empty())
     {
         snapshot.title = title;
     }
+
+    if !snapshot.visible {
+        reset_playback_timing(snapshot);
+    }
+}
+
+fn refresh_live_cache_snapshot(snapshot: &mut EmbeddedPlayerSnapshot, ctx: *mut mpv_handle) {
+    reset_live_cache(snapshot);
+
+    let Some(ranges) = get_mpv_seekable_ranges(ctx) else {
+        return;
+    };
+    let Some(window) = select_live_cache_window(&ranges, snapshot.position_seconds) else {
+        return;
+    };
+
+    let window_seconds = window.end - window.start;
+    if window_seconds <= 0.0 {
+        return;
+    }
+
+    snapshot.live_cache_seekable = true;
+    snapshot.live_cache_start_seconds = window.start;
+    snapshot.live_cache_end_seconds = window.end;
+    snapshot.live_cache_window_seconds = window_seconds;
+    snapshot.is_at_live_edge = is_position_at_live_edge(snapshot.position_seconds, window.end);
+}
+
+fn get_mpv_seekable_ranges(ctx: *mut mpv_handle) -> Option<Vec<SeekableRange>> {
+    let name = CString::new("demuxer-cache-state").ok()?;
+    let mut node = unsafe { std::mem::zeroed::<mpv_node>() };
+    let status = unsafe {
+        mpv_get_property(
+            ctx,
+            name.as_ptr(),
+            mpv_format_MPV_FORMAT_NODE,
+            (&mut node as *mut mpv_node).cast(),
+        )
+    };
+    if status < 0 {
+        return None;
+    }
+
+    let ranges = extract_seekable_ranges_from_node(&node);
+    unsafe { mpv_free_node_contents(&mut node) };
+
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges)
+    }
+}
+
+fn extract_seekable_ranges_from_node(node: &mpv_node) -> Vec<SeekableRange> {
+    let Some(ranges_node) = node_map_get(node, "seekable-ranges") else {
+        return Vec::new();
+    };
+    if ranges_node.format != mpv_format_MPV_FORMAT_NODE_ARRAY {
+        return Vec::new();
+    }
+
+    let list = unsafe { ranges_node.u.list };
+    if list.is_null() {
+        return Vec::new();
+    }
+
+    let list = unsafe { &*list };
+    if list.num <= 0 || list.values.is_null() {
+        return Vec::new();
+    }
+
+    let values = unsafe { std::slice::from_raw_parts(list.values, list.num as usize) };
+    values
+        .iter()
+        .filter_map(|range_node| {
+            let start = node_map_double(range_node, "start")?;
+            let end = node_map_double(range_node, "end")?;
+            (start.is_finite() && end.is_finite() && end > start)
+                .then_some(SeekableRange { start, end })
+        })
+        .collect()
+}
+
+fn node_map_get<'a>(node: &'a mpv_node, key: &str) -> Option<&'a mpv_node> {
+    if node.format != mpv_format_MPV_FORMAT_NODE_MAP {
+        return None;
+    }
+
+    let list = unsafe { node.u.list };
+    if list.is_null() {
+        return None;
+    }
+
+    let list = unsafe { &*list };
+    if list.num <= 0 || list.values.is_null() || list.keys.is_null() {
+        return None;
+    }
+
+    for index in 0..list.num as usize {
+        let key_ptr = unsafe { *list.keys.add(index) };
+        if key_ptr.is_null() {
+            continue;
+        }
+        let current_key = unsafe { CStr::from_ptr(key_ptr).to_string_lossy() };
+        if current_key == key {
+            return Some(unsafe { &*list.values.add(index) });
+        }
+    }
+
+    None
+}
+
+fn node_map_double(node: &mpv_node, key: &str) -> Option<f64> {
+    let value = node_map_get(node, key)?;
+    (value.format == mpv_format_MPV_FORMAT_DOUBLE).then(|| unsafe { value.u.double_ })
+}
+
+fn select_live_cache_window(
+    ranges: &[SeekableRange],
+    position_seconds: f64,
+) -> Option<LiveCacheWindow> {
+    if !position_seconds.is_finite() {
+        return None;
+    }
+
+    let mut merged = merge_seekable_ranges(ranges);
+    merged.sort_by(|a, b| a.end.total_cmp(&b.end));
+    let range = merged.into_iter().rev().find(|range| {
+        position_seconds + LIVE_EDGE_TOLERANCE_SECONDS >= range.start
+            && position_seconds <= range.end + LIVE_EDGE_TOLERANCE_SECONDS
+    })?;
+
+    let end = safe_live_cache_edge(range.start, range.end);
+    let start = range.start.max(end - LIVE_CACHE_WINDOW_SECONDS);
+    (end > start).then_some(LiveCacheWindow { start, end })
+}
+
+fn merge_seekable_ranges(ranges: &[SeekableRange]) -> Vec<SeekableRange> {
+    let mut sorted = ranges
+        .iter()
+        .copied()
+        .filter(|range| range.start.is_finite() && range.end.is_finite() && range.end > range.start)
+        .collect::<Vec<_>>();
+    sorted.sort_by(|a, b| a.start.total_cmp(&b.start));
+
+    let mut merged: Vec<SeekableRange> = Vec::new();
+    for range in sorted {
+        let Some(last) = merged.last_mut() else {
+            merged.push(range);
+            continue;
+        };
+
+        if range.start <= last.end + 1.0 {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+
+    merged
+}
+
+fn is_position_at_live_edge(position_seconds: f64, cache_end_seconds: f64) -> bool {
+    position_seconds.is_finite()
+        && cache_end_seconds.is_finite()
+        && position_seconds >= cache_end_seconds - LIVE_EDGE_TOLERANCE_SECONDS
 }
 
 fn get_mpv_flag_property(ctx: *mut mpv_handle, name: &str) -> Option<bool> {
@@ -871,6 +1200,7 @@ fn is_non_actionable_mpv_log(prefix: &str, _level: &str, text: &str) -> bool {
 
     normalized_prefix.starts_with("ffmpeg/video")
         || normalized_text.contains("missing picture in access unit")
+        || normalized_text.contains("cannot seek backward in linear streams")
 }
 
 fn format_end_file_error(
@@ -899,7 +1229,17 @@ fn format_end_file_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_non_actionable_mpv_log, EmbeddedPlayerCommandPayload, ParsedCommand};
+    use super::{
+        clamp_live_cache_seek_target, clamp_to_live_cache_window,
+        extract_seekable_ranges_from_node, is_non_actionable_mpv_log, is_position_at_live_edge,
+        live_cache_seek_by_target, select_live_cache_window, EmbeddedPlayerCommandPayload,
+        EmbeddedPlayerSnapshot, ParsedCommand, SeekableRange,
+    };
+    use libmpv_sys::{
+        mpv_format_MPV_FORMAT_DOUBLE, mpv_format_MPV_FORMAT_NODE_ARRAY,
+        mpv_format_MPV_FORMAT_NODE_MAP, mpv_node, mpv_node__bindgen_ty_1, mpv_node_list,
+    };
+    use std::ffi::CString;
 
     #[test]
     fn parses_libmpv_commands() {
@@ -929,5 +1269,162 @@ mod tests {
             "error",
             "h264: missing picture in access unit with size 4254",
         ));
+    }
+
+    #[test]
+    fn filters_linear_stream_seek_noise() {
+        assert!(is_non_actionable_mpv_log(
+            "ffmpeg",
+            "error",
+            "Cannot seek backward in linear streams!",
+        ));
+    }
+
+    #[test]
+    fn parses_seek_commands() {
+        let seek_by = EmbeddedPlayerCommandPayload {
+            kind: "seekBy".to_string(),
+            value: Some(serde_json::json!(-10)),
+        };
+        match ParsedCommand::from_payload(seek_by).expect("seekBy should parse") {
+            ParsedCommand::SeekBy(value) => assert_eq!(value, -10.0),
+            _ => panic!("unexpected command variant"),
+        }
+
+        let seek_to = EmbeddedPlayerCommandPayload {
+            kind: "seekTo".to_string(),
+            value: Some(serde_json::json!(123.4)),
+        };
+        match ParsedCommand::from_payload(seek_to).expect("seekTo should parse") {
+            ParsedCommand::SeekTo(value) => assert_eq!(value, 123.4),
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn selects_live_cache_window_with_five_minute_cap() {
+        let ranges = vec![SeekableRange {
+            start: 12.0,
+            end: 420.0,
+        }];
+
+        let window = select_live_cache_window(&ranges, 419.0).expect("window should exist");
+
+        assert_eq!(window.start, 115.0);
+        assert_eq!(window.end, 415.0);
+    }
+
+    #[test]
+    fn ignores_live_cache_ranges_that_do_not_cover_playback_position() {
+        let ranges = vec![SeekableRange {
+            start: 100.0,
+            end: 200.0,
+        }];
+
+        assert!(select_live_cache_window(&ranges, 50.0).is_none());
+    }
+
+    #[test]
+    fn clamps_live_cache_seek_targets() {
+        let snapshot = EmbeddedPlayerSnapshot {
+            live_cache_seekable: true,
+            live_cache_start_seconds: 100.0,
+            live_cache_end_seconds: 400.0,
+            position_seconds: 385.0,
+            ..EmbeddedPlayerSnapshot::default()
+        };
+
+        assert_eq!(clamp_to_live_cache_window(&snapshot, 80.0), Some(100.0));
+        assert_eq!(clamp_to_live_cache_window(&snapshot, 450.0), Some(400.0));
+        assert_eq!(live_cache_seek_by_target(&snapshot, -30.0), Some(355.0));
+        assert_eq!(live_cache_seek_by_target(&snapshot, 30.0), Some(400.0));
+    }
+
+    #[test]
+    fn clamps_to_exposed_live_cache_boundary() {
+        assert_eq!(clamp_live_cache_seek_target(100.0, 400.0, 410.0), 400.0);
+        assert_eq!(clamp_live_cache_seek_target(100.0, 400.0, 390.0), 390.0);
+        assert_eq!(clamp_live_cache_seek_target(100.0, 100.5, 120.0), 100.5);
+    }
+
+    #[test]
+    fn exposes_cache_end_minus_safety_as_live_cache_boundary() {
+        let ranges = vec![SeekableRange {
+            start: 100.0,
+            end: 400.0,
+        }];
+
+        let window = select_live_cache_window(&ranges, 399.0).expect("window should exist");
+
+        assert_eq!(window.end, 395.0);
+    }
+
+    #[test]
+    fn detects_live_edge_with_tolerance() {
+        assert!(is_position_at_live_edge(398.0, 400.0));
+        assert!(!is_position_at_live_edge(397.0, 400.0));
+    }
+
+    #[test]
+    fn extracts_seekable_ranges_from_mpv_node() {
+        let start_key = CString::new("start").unwrap();
+        let end_key = CString::new("end").unwrap();
+        let ranges_key = CString::new("seekable-ranges").unwrap();
+
+        let mut range_values = vec![double_node(10.0), double_node(42.0)];
+        let mut range_keys = vec![start_key.as_ptr().cast_mut(), end_key.as_ptr().cast_mut()];
+        let mut range_list = mpv_node_list {
+            num: range_values.len() as i32,
+            values: range_values.as_mut_ptr(),
+            keys: range_keys.as_mut_ptr(),
+        };
+        let range_node = mpv_node {
+            u: mpv_node__bindgen_ty_1 {
+                list: &mut range_list,
+            },
+            format: mpv_format_MPV_FORMAT_NODE_MAP,
+        };
+
+        let mut array_values = vec![range_node];
+        let mut array_list = mpv_node_list {
+            num: array_values.len() as i32,
+            values: array_values.as_mut_ptr(),
+            keys: std::ptr::null_mut(),
+        };
+        let array_node = mpv_node {
+            u: mpv_node__bindgen_ty_1 {
+                list: &mut array_list,
+            },
+            format: mpv_format_MPV_FORMAT_NODE_ARRAY,
+        };
+
+        let mut root_values = vec![array_node];
+        let mut root_keys = vec![ranges_key.as_ptr().cast_mut()];
+        let mut root_list = mpv_node_list {
+            num: root_values.len() as i32,
+            values: root_values.as_mut_ptr(),
+            keys: root_keys.as_mut_ptr(),
+        };
+        let root_node = mpv_node {
+            u: mpv_node__bindgen_ty_1 {
+                list: &mut root_list,
+            },
+            format: mpv_format_MPV_FORMAT_NODE_MAP,
+        };
+
+        assert_eq!(
+            extract_seekable_ranges_from_node(&root_node),
+            vec![SeekableRange {
+                start: 10.0,
+                end: 42.0
+            }]
+        );
+    }
+
+    fn double_node(value: f64) -> mpv_node {
+        mpv_node {
+            u: mpv_node__bindgen_ty_1 { double_: value },
+            format: mpv_format_MPV_FORMAT_DOUBLE,
+        }
     }
 }

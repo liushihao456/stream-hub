@@ -22,6 +22,14 @@ const emptyEmbeddedPlayerState = {
   paused: false,
   muted: false,
   volume: 100,
+  positionSeconds: 0,
+  durationSeconds: 0,
+  seekable: false,
+  liveCacheSeekable: false,
+  liveCacheStartSeconds: 0,
+  liveCacheEndSeconds: 0,
+  liveCacheWindowSeconds: 0,
+  isAtLiveEdge: false,
   usingExternalPlayer: false,
   errorMessage: "",
 };
@@ -102,6 +110,23 @@ function LeftChevronIcon() {
       />
     </svg>
   );
+}
+
+function formatPlaybackTime(totalSeconds) {
+  const safeTotal = Math.max(0, Math.floor(Number.isFinite(totalSeconds) ? totalSeconds : 0));
+  const hours = Math.floor(safeTotal / 3600);
+  const minutes = Math.floor((safeTotal % 3600) / 60);
+  const seconds = safeTotal % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatLiveOffset(totalSeconds) {
+  return `-${formatPlaybackTime(totalSeconds)}`;
 }
 
 function getImageForStreamer(streamer) {
@@ -277,12 +302,40 @@ function StreamerGroup({
 
 function PlaybackPage({
   surfaceRef,
-  backButtonVisible,
+  controlsVisible,
+  playbackTitle,
+  playbackPositionSeconds,
+  playbackTrackStartSeconds,
+  playbackTrackEndSeconds,
+  playbackTrackMode,
+  playbackIsAtLiveEdge,
+  playbackSeekable,
+  playbackTrackDragging,
   danmakuItems,
   danmakuFontSize,
   onBack,
   onPointerMove,
+  onTrackPointerDown,
+  onTrackPointerMove,
+  onTrackPointerUp,
+  onTrackPointerCancel,
 }) {
+  const trackStart = Number.isFinite(playbackTrackStartSeconds) ? playbackTrackStartSeconds : 0;
+  const trackEnd = Number.isFinite(playbackTrackEndSeconds) ? playbackTrackEndSeconds : 0;
+  const normalizedDuration = trackEnd > trackStart ? trackEnd - trackStart : 0;
+  const normalizedPosition =
+    normalizedDuration > 0
+      ? Math.min(trackEnd, Math.max(trackStart, playbackPositionSeconds))
+      : trackStart;
+  const progressPercent =
+    playbackSeekable && normalizedDuration > 0
+      ? `${((normalizedPosition - trackStart) / normalizedDuration) * 100}%`
+      : "100%";
+  const isLiveCacheTrack = playbackTrackMode === "live-cache";
+  const liveOffsetSeconds = isLiveCacheTrack
+    ? Math.max(0, trackEnd - normalizedPosition)
+    : 0;
+
   return (
     <main className="playback-page" onPointerMove={onPointerMove}>
       <div
@@ -308,13 +361,57 @@ function PlaybackPage({
       </div>
       <button
         type="button"
-        className={`playback-back-button ${backButtonVisible ? "visible" : ""}`}
+        className={`playback-back-button ${controlsVisible ? "visible" : ""}`}
         onClick={onBack}
         aria-label="返回"
         title="返回"
       >
         <LeftChevronIcon />
       </button>
+      <div className={`playback-track-region ${controlsVisible ? "visible" : ""}`}>
+        <div className="playback-track-gradient" aria-hidden="true" />
+        <section className="playback-track-panel" aria-label="播放轨道">
+          <div className="playback-track-meta">
+            <p className="playback-track-title">{playbackTitle || "正在播放"}</p>
+            {isLiveCacheTrack ? (
+              playbackIsAtLiveEdge || liveOffsetSeconds <= 2.5 ? (
+                <span className="playback-track-live-pill">LIVE</span>
+              ) : (
+                <span className="playback-track-time playback-track-live-offset">
+                  {formatLiveOffset(liveOffsetSeconds)}
+                </span>
+              )
+            ) : playbackSeekable ? (
+              <span className="playback-track-time">
+                {formatPlaybackTime(normalizedPosition - trackStart)} / {formatPlaybackTime(normalizedDuration)}
+              </span>
+            ) : (
+              <span className="playback-track-live-pill">LIVE</span>
+            )}
+          </div>
+          <div
+            className={`playback-track-rail ${playbackSeekable ? "seekable" : "live"} ${isLiveCacheTrack ? "live-cache" : ""} ${playbackTrackDragging ? "dragging" : ""}`.trim()}
+            onPointerDown={onTrackPointerDown}
+            onPointerMove={onTrackPointerMove}
+            onPointerUp={onTrackPointerUp}
+            onPointerCancel={onTrackPointerCancel}
+            onLostPointerCapture={onTrackPointerCancel}
+            aria-disabled={!playbackSeekable}
+          >
+            <div className="playback-track-rail-base" aria-hidden="true" />
+            <div
+              className="playback-track-rail-fill"
+              aria-hidden="true"
+              style={{ width: progressPercent }}
+            />
+            <div
+              className="playback-track-thumb"
+              aria-hidden="true"
+              style={{ left: progressPercent }}
+            />
+          </div>
+        </section>
+      </div>
     </main>
   );
 }
@@ -343,6 +440,7 @@ function App() {
   const [playbackBackVisible, setPlaybackBackVisible] = useState(false);
   const [currentPlaybackStreamer, setCurrentPlaybackStreamer] = useState(null);
   const [danmakuItems, setDanmakuItems] = useState([]);
+  const [playbackSeekDraftSeconds, setPlaybackSeekDraftSeconds] = useState(null);
   const playerSurfaceRef = useRef(null);
   const boundsFrameRef = useRef(0);
   const lastBoundsRef = useRef("");
@@ -352,6 +450,10 @@ function App() {
   const restoreScrollRef = useRef(null);
   const playbackBackHideTimerRef = useRef(0);
   const playbackPointerPositionRef = useRef({ x: null, y: null });
+  const playbackControlsHoldCountRef = useRef(0);
+  const playbackTrackPointerIdRef = useRef(null);
+  const playbackTrackDraggingRef = useRef(false);
+  const playbackStatePollInFlightRef = useRef(false);
   const playbackExitInFlightRef = useRef(false);
   const playbackAwaitingStartRef = useRef(false);
   const danmakuSocketRef = useRef(null);
@@ -367,11 +469,27 @@ function App() {
   }
 
   function schedulePlaybackBackHide() {
+    if (viewMode !== "playback" || playbackControlsHoldCountRef.current > 0) {
+      return;
+    }
     clearPlaybackBackHideTimer();
     playbackBackHideTimerRef.current = window.setTimeout(() => {
       setPlaybackBackVisible(false);
       playbackBackHideTimerRef.current = 0;
     }, PLAYBACK_BACK_HIDE_DELAY_MS);
+  }
+
+  function holdPlaybackControls() {
+    playbackControlsHoldCountRef.current += 1;
+    clearPlaybackBackHideTimer();
+    setPlaybackBackVisible(true);
+  }
+
+  function releasePlaybackControls() {
+    playbackControlsHoldCountRef.current = Math.max(0, playbackControlsHoldCountRef.current - 1);
+    if (playbackControlsHoldCountRef.current === 0) {
+      schedulePlaybackBackHide();
+    }
   }
 
   function normalizeDanmakuFontSize(value) {
@@ -466,16 +584,21 @@ function App() {
   function restoreBrowseView() {
     playbackAwaitingStartRef.current = false;
     clearPlaybackBackHideTimer();
+    playbackControlsHoldCountRef.current = 0;
     playbackPointerPositionRef.current = { x: null, y: null };
+    playbackTrackPointerIdRef.current = null;
+    playbackTrackDraggingRef.current = false;
+    playbackStatePollInFlightRef.current = false;
     clearDanmakuState();
     setCurrentPlaybackStreamer(null);
+    setPlaybackSeekDraftSeconds(null);
     setPlaybackBackVisible(false);
     setViewMode("browse");
     setActiveTab(playbackOriginRef.current.activeTab);
     restoreScrollRef.current = playbackOriginRef.current.scrollY;
   }
 
-  function revealPlaybackBackButton() {
+  function revealPlaybackControls() {
     if (viewMode !== "playback") {
       return;
     }
@@ -496,7 +619,182 @@ function App() {
     }
 
     playbackPointerPositionRef.current = { x: nextX, y: nextY };
-    revealPlaybackBackButton();
+    revealPlaybackControls();
+  }
+
+  function getPlaybackTrackRange() {
+    const liveStart = Number(embeddedPlayer.liveCacheStartSeconds);
+    const liveEnd = Number(embeddedPlayer.liveCacheEndSeconds);
+    if (
+      embeddedPlayer.liveCacheSeekable
+      && Number.isFinite(liveStart)
+      && Number.isFinite(liveEnd)
+      && liveEnd > liveStart
+    ) {
+      return {
+        mode: "live-cache",
+        start: liveStart,
+        end: liveEnd,
+        duration: liveEnd - liveStart,
+        seekable: true,
+      };
+    }
+
+    const duration = embeddedPlayer.durationSeconds > 0 ? embeddedPlayer.durationSeconds : 0;
+    if (embeddedPlayer.seekable && duration > 0) {
+      return {
+        mode: "duration",
+        start: 0,
+        end: duration,
+        duration,
+        seekable: true,
+      };
+    }
+
+    return {
+      mode: "live",
+      start: 0,
+      end: 0,
+      duration: 0,
+      seekable: false,
+    };
+  }
+
+  function isPlaybackSeekable() {
+    return getPlaybackTrackRange().seekable;
+  }
+
+  function clampPlaybackSeekSeconds(value) {
+    const range = getPlaybackTrackRange();
+    if (!Number.isFinite(value) || !range.seekable || range.duration <= 0) {
+      return 0;
+    }
+    return Math.min(range.end, Math.max(range.start, value));
+  }
+
+  function getPlaybackTrackSecondsFromClientX(clientX, element) {
+    const range = getPlaybackTrackRange();
+    if (!range.seekable || range.duration <= 0) {
+      return range.start;
+    }
+    const rect = element.getBoundingClientRect();
+    const ratio = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
+    return clampPlaybackSeekSeconds(range.start + range.duration * Math.min(1, Math.max(0, ratio)));
+  }
+
+  async function performPlaybackSeekBy(offsetSeconds) {
+    if (!isPlaybackSeekable()) {
+      return embeddedPlayer;
+    }
+
+    const range = getPlaybackTrackRange();
+    if (range.mode === "live-cache") {
+      const nextSeconds = Math.min(
+        range.end,
+        Math.max(range.start, embeddedPlayer.positionSeconds + offsetSeconds),
+      );
+      return performPlaybackSeekTo(nextSeconds);
+    }
+
+    const next = await invoke("embedded_player_command", {
+      command: { kind: "seekBy", value: offsetSeconds },
+    });
+    setEmbeddedPlayer(next);
+    return next;
+  }
+
+  async function performPlaybackSeekTo(positionSeconds) {
+    if (!isPlaybackSeekable()) {
+      return embeddedPlayer;
+    }
+
+    const next = await invoke("embedded_player_command", {
+      command: { kind: "seekTo", value: clampPlaybackSeekSeconds(positionSeconds) },
+    });
+    setEmbeddedPlayer(next);
+    return next;
+  }
+
+  function handlePlaybackTrackPointerDown(event) {
+    revealPlaybackControls();
+    if (!isPlaybackSeekable()) {
+      return;
+    }
+
+    const nextSeconds = getPlaybackTrackSecondsFromClientX(event.clientX, event.currentTarget);
+    playbackTrackDraggingRef.current = true;
+    playbackTrackPointerIdRef.current = event.pointerId;
+    holdPlaybackControls();
+    setPlaybackSeekDraftSeconds(nextSeconds);
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  }
+
+  function handlePlaybackTrackPointerMove(event) {
+    if (
+      !playbackTrackDraggingRef.current
+      || playbackTrackPointerIdRef.current !== event.pointerId
+      || !isPlaybackSeekable()
+    ) {
+      return;
+    }
+
+    setPlaybackSeekDraftSeconds(getPlaybackTrackSecondsFromClientX(event.clientX, event.currentTarget));
+    event.preventDefault();
+  }
+
+  function finishPlaybackTrackInteraction({ commit, pointerTarget, pointerId, nextSeconds = 0 }) {
+    if (!playbackTrackDraggingRef.current) {
+      return;
+    }
+
+    playbackTrackDraggingRef.current = false;
+    playbackTrackPointerIdRef.current = null;
+    if (pointerTarget?.hasPointerCapture?.(pointerId)) {
+      pointerTarget.releasePointerCapture(pointerId);
+    }
+
+    if (!commit || !isPlaybackSeekable()) {
+      setPlaybackSeekDraftSeconds(null);
+      releasePlaybackControls();
+      return;
+    }
+
+    void performPlaybackSeekTo(nextSeconds)
+      .catch(err => {
+        setError(String(err));
+      })
+      .finally(() => {
+        setPlaybackSeekDraftSeconds(null);
+        releasePlaybackControls();
+      });
+  }
+
+  function handlePlaybackTrackPointerUp(event) {
+    if (!playbackTrackDraggingRef.current || playbackTrackPointerIdRef.current !== event.pointerId) {
+      return;
+    }
+
+    const nextSeconds = getPlaybackTrackSecondsFromClientX(event.clientX, event.currentTarget);
+    finishPlaybackTrackInteraction({
+      commit: true,
+      pointerTarget: event.currentTarget,
+      pointerId: event.pointerId,
+      nextSeconds,
+    });
+    event.preventDefault();
+  }
+
+  function handlePlaybackTrackPointerCancel(event) {
+    if (!playbackTrackDraggingRef.current) {
+      return;
+    }
+
+    finishPlaybackTrackInteraction({
+      commit: false,
+      pointerTarget: event.currentTarget,
+      pointerId: event.pointerId,
+    });
   }
 
   function enterPlaybackView() {
@@ -507,7 +805,12 @@ function App() {
     };
     restoreScrollRef.current = null;
     clearPlaybackBackHideTimer();
+    playbackControlsHoldCountRef.current = 0;
     playbackPointerPositionRef.current = { x: null, y: null };
+    playbackTrackPointerIdRef.current = null;
+    playbackTrackDraggingRef.current = false;
+    playbackStatePollInFlightRef.current = false;
+    setPlaybackSeekDraftSeconds(null);
     setPlaybackBackVisible(false);
     setViewMode("playback");
     window.scrollTo(0, 0);
@@ -660,18 +963,40 @@ function App() {
     }
 
     function handleKeyDown(event) {
-      if (event.key !== "Escape") {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        void exitPlaybackView({ stopPlayback: true });
         return;
       }
-      event.preventDefault();
-      void exitPlaybackView({ stopPlayback: true });
+
+      if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && isPlaybackSeekable()) {
+        event.preventDefault();
+        holdPlaybackControls();
+        void performPlaybackSeekBy(event.key === "ArrowLeft" ? -10 : 10)
+          .catch(err => {
+            setError(String(err));
+          })
+          .finally(() => {
+            releasePlaybackControls();
+          });
+      }
     }
 
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [viewMode, embeddedPlayer.visible, embeddedPlayer.phase]);
+  }, [
+    viewMode,
+    embeddedPlayer.visible,
+    embeddedPlayer.phase,
+    embeddedPlayer.seekable,
+    embeddedPlayer.durationSeconds,
+    embeddedPlayer.liveCacheSeekable,
+    embeddedPlayer.liveCacheStartSeconds,
+    embeddedPlayer.liveCacheEndSeconds,
+    embeddedPlayer.positionSeconds,
+  ]);
 
   useEffect(() => {
     if (viewMode !== "playback") {
@@ -782,6 +1107,49 @@ function App() {
       clearDanmakuState();
     };
   }, [viewMode, currentPlaybackStreamer?.target]);
+
+  useEffect(() => {
+    if (viewMode !== "playback") {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    async function pollPlaybackState() {
+      if (
+        cancelled
+        || playbackTrackDraggingRef.current
+        || playbackStatePollInFlightRef.current
+      ) {
+        return;
+      }
+
+      playbackStatePollInFlightRef.current = true;
+      try {
+        const next = await invoke("embedded_player_get_state");
+        if (!cancelled) {
+          setEmbeddedPlayer(next);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(String(err));
+        }
+      } finally {
+        playbackStatePollInFlightRef.current = false;
+      }
+    }
+
+    void pollPlaybackState();
+    const intervalId = window.setInterval(() => {
+      void pollPlaybackState();
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      playbackStatePollInFlightRef.current = false;
+    };
+  }, [viewMode]);
 
   useEffect(() => {
     const element = playerSurfaceRef.current;
@@ -1075,16 +1443,40 @@ function App() {
   }
 
   if (viewMode === "playback") {
+    const playbackTrackRange = getPlaybackTrackRange();
+    const playbackSeekable = playbackTrackRange.seekable;
+    const playbackTrackPosition =
+      playbackSeekDraftSeconds == null
+        ? embeddedPlayer.positionSeconds
+        : playbackSeekDraftSeconds;
+    const playbackTitle =
+      embeddedPlayer.title
+      || currentPlaybackStreamer?.name
+      || embeddedPlayer.streamerName
+      || "正在播放";
+
     return (
       <PlaybackPage
         surfaceRef={playerSurfaceRef}
-        backButtonVisible={playbackBackVisible}
+        controlsVisible={playbackBackVisible}
+        playbackTitle={playbackTitle}
+        playbackPositionSeconds={playbackTrackPosition}
+        playbackTrackStartSeconds={playbackTrackRange.start}
+        playbackTrackEndSeconds={playbackTrackRange.end}
+        playbackTrackMode={playbackTrackRange.mode}
+        playbackIsAtLiveEdge={embeddedPlayer.isAtLiveEdge}
+        playbackSeekable={playbackSeekable}
+        playbackTrackDragging={playbackSeekDraftSeconds != null}
         danmakuItems={danmakuItems}
         danmakuFontSize={normalizeDanmakuFontSize(settings.danmakuFontSize)}
         onBack={() => {
           void exitPlaybackView({ stopPlayback: true });
         }}
         onPointerMove={handlePlaybackPointerMove}
+        onTrackPointerDown={handlePlaybackTrackPointerDown}
+        onTrackPointerMove={handlePlaybackTrackPointerMove}
+        onTrackPointerUp={handlePlaybackTrackPointerUp}
+        onTrackPointerCancel={handlePlaybackTrackPointerCancel}
       />
     );
   }
