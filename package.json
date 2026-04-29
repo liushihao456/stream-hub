@@ -1,6 +1,6 @@
 {
   "name": "stream-hub",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Desktop app for launching favorite streamers in mpv",
   "main": "douyu_extract_playurl.js",
   "scripts": {
