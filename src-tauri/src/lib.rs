@@ -5,7 +5,6 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use base64::Engine;
-use block2::RcBlock;
 use flate2::read::GzDecoder;
 use futures_util::{SinkExt, StreamExt};
 use regex::Regex;
@@ -19,7 +18,6 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -38,6 +36,8 @@ use uuid::Uuid;
 mod player;
 
 #[cfg(target_os = "macos")]
+use block2::RcBlock;
+#[cfg(target_os = "macos")]
 use objc2::runtime::AnyObject;
 #[cfg(target_os = "macos")]
 use objc2::{class, msg_send};
@@ -47,6 +47,8 @@ use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 use objc2_foundation::{NSArray, NSHTTPCookie, NSString};
 #[cfg(target_os = "macos")]
 use objc2_web_kit::WKWebView;
+#[cfg(target_os = "macos")]
+use std::ptr::NonNull;
 
 const DOUYU_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
