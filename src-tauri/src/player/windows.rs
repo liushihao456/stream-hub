@@ -9,7 +9,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 pub struct WindowsHost {
-    hwnd: HWND,
+    hwnd: isize,
 }
 
 impl WindowsHost {
@@ -37,7 +37,7 @@ impl WindowsHost {
                 1,
                 1,
                 parent,
-                0,
+                ptr::null_mut(),
                 handle
                     .hinstance
                     .map(|value| value.get())
@@ -45,14 +45,16 @@ impl WindowsHost {
                 ptr::null(),
             )
         };
-        if hwnd == 0 {
+        if hwnd.is_null() {
             return Err("创建播放器宿主窗口失败".to_string());
         }
-        Ok(Self { hwnd })
+        Ok(Self {
+            hwnd: hwnd as isize,
+        })
     }
 
     pub fn embed_id(&self) -> isize {
-        self.hwnd as isize
+        self.hwnd
     }
 
     pub fn set_bounds(
@@ -62,7 +64,7 @@ impl WindowsHost {
     ) -> Result<(), String> {
         let moved = unsafe {
             MoveWindow(
-                self.hwnd,
+                self.hwnd as HWND,
                 bounds.x.round() as i32,
                 bounds.y.round() as i32,
                 bounds.width.round() as i32,
@@ -79,7 +81,7 @@ impl WindowsHost {
 
     pub fn set_visible(&mut self, _app: &AppHandle, visible: bool) -> Result<(), String> {
         unsafe {
-            ShowWindow(self.hwnd, if visible { SW_SHOW } else { SW_HIDE });
+            ShowWindow(self.hwnd as HWND, if visible { SW_SHOW } else { SW_HIDE });
         }
         Ok(())
     }

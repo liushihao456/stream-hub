@@ -592,7 +592,9 @@ impl ParsedCommand {
     }
 }
 
-fn create_mpv(_embed_id: isize) -> Result<*mut mpv_handle, String> {
+fn create_mpv(
+    #[cfg_attr(target_os = "macos", allow(unused_variables))] embed_id: isize,
+) -> Result<*mut mpv_handle, String> {
     let ctx = unsafe { mpv_create() };
     if ctx.is_null() {
         return Err("初始化 libmpv 失败".to_string());
