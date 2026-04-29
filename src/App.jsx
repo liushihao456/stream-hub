@@ -13,6 +13,11 @@ const PLAYBACK_BACK_HIDE_DELAY_MS = 2000;
 const DEFAULT_DANMAKU_FONT_SIZE = 18;
 const DANMAKU_TOP_PADDING = 24;
 const DANMAKU_BOTTOM_PADDING = 28;
+const DANMAKU_SPEED_PX_PER_SECOND = 120;
+const DANMAKU_EXIT_PADDING_PX = 64;
+const DANMAKU_ROW_GAP_PX = 96;
+const DANMAKU_MAX_FLUSH_PER_FRAME = 6;
+const DANMAKU_MAX_PENDING_TEXTS = 120;
 const emptyEmbeddedPlayerState = {
   phase: "idle",
   title: "",
@@ -127,6 +132,20 @@ function formatPlaybackTime(totalSeconds) {
 
 function formatLiveOffset(totalSeconds) {
   return `-${formatPlaybackTime(totalSeconds)}`;
+}
+
+function estimateDanmakuTextWidth(text, fontSize) {
+  let units = 0;
+  for (const char of text) {
+    if (/\s/.test(char)) {
+      units += 0.35;
+    } else if (char.charCodeAt(0) <= 0x00ff) {
+      units += 0.58;
+    } else {
+      units += 1;
+    }
+  }
+  return Math.ceil((units + 0.4) * fontSize);
 }
 
 function getImageForStreamer(streamer) {
@@ -351,6 +370,8 @@ function PlaybackPage({
               style={{
                 top: `${item.top}px`,
                 fontSize: `${danmakuFontSize}px`,
+                "--danmaku-distance": `${item.distancePx}px`,
+                "--danmaku-translate-x": `${-item.distancePx}px`,
                 animationDuration: `${item.durationMs}ms`,
               }}
             >
@@ -459,6 +480,8 @@ function App() {
   const danmakuSocketRef = useRef(null);
   const danmakuTimersRef = useRef(new Map());
   const danmakuRowAvailabilityRef = useRef([]);
+  const danmakuPendingTextsRef = useRef([]);
+  const danmakuFlushFrameRef = useRef(0);
   const danmakuNextIdRef = useRef(1);
 
   function clearPlaybackBackHideTimer() {
@@ -508,6 +531,11 @@ function App() {
   }
 
   function clearDanmakuState() {
+    if (danmakuFlushFrameRef.current) {
+      window.cancelAnimationFrame(danmakuFlushFrameRef.current);
+      danmakuFlushFrameRef.current = 0;
+    }
+    danmakuPendingTextsRef.current = [];
     clearDanmakuTimers();
     danmakuRowAvailabilityRef.current = [];
     setDanmakuItems([]);
@@ -522,6 +550,34 @@ function App() {
     setDanmakuItems(current => current.filter(item => item.id !== id));
   }
 
+  function scheduleDanmakuFlush() {
+    if (danmakuFlushFrameRef.current) {
+      return;
+    }
+
+    danmakuFlushFrameRef.current = window.requestAnimationFrame(() => {
+      danmakuFlushFrameRef.current = 0;
+      const pending = danmakuPendingTextsRef.current.splice(0, DANMAKU_MAX_FLUSH_PER_FRAME);
+      for (const text of pending) {
+        enqueueDanmaku(text);
+      }
+      if (danmakuPendingTextsRef.current.length > 0) {
+        scheduleDanmakuFlush();
+      }
+    });
+  }
+
+  function queueDanmakuText(text) {
+    danmakuPendingTextsRef.current.push(text);
+    if (danmakuPendingTextsRef.current.length > DANMAKU_MAX_PENDING_TEXTS) {
+      danmakuPendingTextsRef.current.splice(
+        0,
+        danmakuPendingTextsRef.current.length - DANMAKU_MAX_PENDING_TEXTS,
+      );
+    }
+    scheduleDanmakuFlush();
+  }
+
   function enqueueDanmaku(text) {
     const content = text.trim();
     if (!content) {
@@ -530,7 +586,10 @@ function App() {
 
     const danmakuFontSize = normalizeDanmakuFontSize(settings.danmakuFontSize);
     const danmakuRowHeight = danmakuFontSize + 12;
+    const stageWidth = playerSurfaceRef.current?.clientWidth || window.innerWidth || 1280;
     const stageHeight = playerSurfaceRef.current?.clientHeight || window.innerHeight || 720;
+    const textWidth = estimateDanmakuTextWidth(content, danmakuFontSize);
+    const distancePx = Math.ceil(stageWidth + textWidth + DANMAKU_EXIT_PADDING_PX);
     const availableHeight = Math.max(
       danmakuRowHeight,
       stageHeight - DANMAKU_TOP_PADDING - DANMAKU_BOTTOM_PADDING,
@@ -558,14 +617,15 @@ function App() {
       }
     }
 
-    const gapMs = 900 + Math.min(2200, content.length * 55);
+    const gapMs = Math.ceil(((textWidth + DANMAKU_ROW_GAP_PX) / DANMAKU_SPEED_PX_PER_SECOND) * 1000);
     rowAvailability[rowIndex] = Math.max(now, earliestAvailable) + gapMs;
 
-    const durationMs = Math.min(14000, Math.max(9000, 8200 + content.length * 85));
+    const durationMs = Math.ceil((distancePx / DANMAKU_SPEED_PX_PER_SECOND) * 1000);
     const item = {
       id: danmakuNextIdRef.current,
       text: content,
       top: DANMAKU_TOP_PADDING + rowIndex * danmakuRowHeight,
+      distancePx,
       durationMs,
     };
     danmakuNextIdRef.current += 1;
@@ -1078,7 +1138,7 @@ function App() {
             if (kind !== "chat") {
               continue;
             }
-            enqueueDanmaku(text);
+            queueDanmakuText(text);
           }
         });
 

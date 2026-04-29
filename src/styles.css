@@ -97,6 +97,8 @@ button:focus {
 .playback-danmaku-item {
   position: absolute;
   left: 100%;
+  --danmaku-distance: calc(100vw + 100% + 4rem);
+  --danmaku-translate-x: calc(-100vw - 100% - 4rem);
   max-width: min(72vw, 1100px);
   padding: 0 0.2rem;
   color: #ffffff;
@@ -122,7 +124,7 @@ button:focus {
   }
 
   to {
-    transform: translate3d(calc(-100vw - 100% - 4rem), 0, 0);
+    transform: translate3d(var(--danmaku-translate-x), 0, 0);
   }
 }
 
