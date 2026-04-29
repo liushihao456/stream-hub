@@ -148,6 +148,35 @@ function estimateDanmakuTextWidth(text, fontSize) {
   return Math.ceil((units + 0.4) * fontSize);
 }
 
+function streamerSyncKeys(streamer) {
+  const platform = streamer.platform || "";
+  const target = streamer.target || "";
+  return [
+    streamer.id ? `id:${streamer.id}` : "",
+    platform || target ? `target:${platform}:${target}` : "",
+  ].filter(Boolean);
+}
+
+function mergeSyncedStreamerUpdates(currentStreamers, sourceStreamers, syncedStreamers) {
+  const updates = new Map();
+  syncedStreamers.forEach((syncedStreamer, index) => {
+    const sourceStreamer = sourceStreamers[index];
+    if (!sourceStreamer) {
+      return;
+    }
+    for (const key of streamerSyncKeys(sourceStreamer)) {
+      updates.set(key, syncedStreamer);
+    }
+  });
+
+  return currentStreamers.map(streamer => {
+    const update = streamerSyncKeys(streamer)
+      .map(key => updates.get(key))
+      .find(Boolean);
+    return update ? { ...streamer, ...update, id: streamer.id || update.id } : streamer;
+  });
+}
+
 function getImageForStreamer(streamer) {
   if (streamer.isOnline && streamer.screenshotUrl) {
     return streamer.screenshotUrl;
@@ -897,6 +926,30 @@ function App() {
     }
   }
 
+  async function syncStreamerStatusInBackground(
+    streamersToSync,
+    { showMessage = false, shouldApply = () => true } = {},
+  ) {
+    if (!streamersToSync.length) {
+      return;
+    }
+
+    try {
+      const syncedStreamers = await invoke("sync_streamers_status", { streamers: streamersToSync });
+      if (!shouldApply()) {
+        return;
+      }
+      setStreamers(current => mergeSyncedStreamerUpdates(current, streamersToSync, syncedStreamers));
+      if (showMessage) {
+        setMessage("已刷新主播状态");
+      }
+    } catch (err) {
+      if (shouldApply()) {
+        setError(String(err));
+      }
+    }
+  }
+
   useEffect(() => {
     let cancelled = false;
     let unlistenUpdated;
@@ -942,13 +995,13 @@ function App() {
             danmakuFontSize: normalizeDanmakuFontSize(savedSettings.danmakuFontSize),
           });
           setEmbeddedPlayer(embeddedState);
+          setStreamers(savedStreamers);
+          setLoading(false);
+
           if (savedStreamers.length > 0) {
-            const syncedStreamers = await invoke("sync_streamers_status", { streamers: savedStreamers });
-            if (!cancelled) {
-              setStreamers(syncedStreamers);
-            }
-          } else {
-            setStreamers(savedStreamers);
+            void syncStreamerStatusInBackground(savedStreamers, {
+              shouldApply: () => !cancelled,
+            });
           }
         }
       } catch (err) {
@@ -1397,8 +1450,7 @@ function App() {
     setRefreshing(true);
     setError("");
     try {
-      const syncedStreamers = await invoke("sync_streamers_status", { streamers });
-      setStreamers(syncedStreamers);
+      await syncStreamerStatusInBackground(streamers, { showMessage: true });
     } catch (err) {
       setError(String(err));
     } finally {
