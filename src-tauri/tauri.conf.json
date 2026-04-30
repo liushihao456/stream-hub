@@ -6,6 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": "node scripts/bundle-libmpv-runtime.mjs",
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../dist"
   },
@@ -50,6 +51,12 @@
       "resources/huya_icon.ico",
       "../douyu_extract_playurl.js",
       "../douyu_search_streamers.js"
-    ]
+    ],
+    "macOS": {
+      "signingIdentity": "-",
+      "files": {
+        "Frameworks": "target/libmpv-runtime/macos/Frameworks"
+      }
+    }
   }
 }

@@ -27,7 +27,7 @@ jobs:
         include:
           - label: macOS
             os: macos-latest
-            bundles: dmg
+            bundles: app
             artifact: stream-hub-macos
             files: src-tauri/target/release/bundle/dmg/*.dmg
           - label: Windows
@@ -99,6 +99,7 @@ jobs:
           & lib /def:$def /name:libmpv-2.dll /out:$lib /machine:x64
 
           "LIB=$mpvDir;$env:LIB" >> $env:GITHUB_ENV
+          "STREAM_HUB_MPV_RUNTIME_DIR=$mpvDir" >> $env:GITHUB_ENV
           $mpvDir >> $env:GITHUB_PATH
 
       - name: Configure npm registry
@@ -111,6 +112,19 @@ jobs:
 
       - name: Build installer
         run: npm run tauri:build -- --bundles ${{ matrix.bundles }} --ci
+
+      - name: Create macOS DMG
+        if: runner.os == 'macOS'
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          ARCH=$(uname -m)
+          mkdir -p src-tauri/target/release/bundle/dmg
+          hdiutil create \
+            -volname "Stream Hub" \
+            -srcfolder "src-tauri/target/release/bundle/macos/Stream Hub.app" \
+            -ov \
+            -format UDZO \
+            "src-tauri/target/release/bundle/dmg/Stream.Hub_${VERSION}_${ARCH}.dmg"
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4

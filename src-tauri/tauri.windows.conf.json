@@ -1,0 +1,18 @@
+{
+  "bundle": {
+    "resources": {
+      "resources/bilibili_icon.ico": "bilibili_icon.ico",
+      "resources/douyin.js": "douyin.js",
+      "resources/douyin_frontier_sign.js": "douyin_frontier_sign.js",
+      "resources/douyin_icon.ico": "douyin_icon.ico",
+      "resources/douyin_live_helper.js": "douyin_live_helper.js",
+      "resources/douyu_danmaku_bridge.js": "douyu_danmaku_bridge.js",
+      "resources/douyu_icon.ico": "douyu_icon.ico",
+      "resources/huya.js": "huya.js",
+      "resources/huya_icon.ico": "huya_icon.ico",
+      "../douyu_extract_playurl.js": "douyu_extract_playurl.js",
+      "../douyu_search_streamers.js": "douyu_search_streamers.js",
+      "target/libmpv-runtime/windows": ""
+    }
+  }
+}
