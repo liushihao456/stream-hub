@@ -1,6 +1,6 @@
 {
   "name": "stream-hub",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Desktop app for watching favorite streamers with embedded libmpv",
   "main": "douyu_extract_playurl.js",
   "scripts": {
