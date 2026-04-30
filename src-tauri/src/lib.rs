@@ -441,6 +441,18 @@ struct HuyaLiveData {
     screenshot: String,
     #[serde(
         default,
+        rename = "totalCount",
+        deserialize_with = "deserialize_value_to_string"
+    )]
+    total_count: String,
+    #[serde(
+        default,
+        rename = "activityCount",
+        deserialize_with = "deserialize_value_to_string"
+    )]
+    activity_count: String,
+    #[serde(
+        default,
         rename = "profileRoom",
         deserialize_with = "deserialize_value_to_string"
     )]
@@ -962,10 +974,6 @@ fn fetch_bilibili_search(keyword: &str) -> Result<Vec<BilibiliLiveSearchItem>, S
         REFERER,
         HeaderValue::from_static("https://www.bilibili.com/"),
     );
-    let _ = client
-        .get("https://www.bilibili.com")
-        .headers(headers.clone())
-        .send();
 
     let response: BilibiliLiveSearchResponse = client
         .get("https://api.bilibili.com/x/web-interface/search/type")
@@ -982,6 +990,35 @@ fn fetch_bilibili_search(keyword: &str) -> Result<Vec<BilibiliLiveSearchItem>, S
         .map_err(|err| err.to_string())?;
 
     Ok(response.data.result)
+}
+
+fn fetch_bilibili_public_json(url: &str, referer: &str) -> Result<Value, String> {
+    let client = bilibili_client()?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(BILIBILI_USER_AGENT).map_err(|err| err.to_string())?,
+    );
+    headers.insert(
+        REFERER,
+        HeaderValue::from_str(referer).map_err(|err| err.to_string())?,
+    );
+    headers.insert(
+        ORIGIN,
+        HeaderValue::from_static("https://live.bilibili.com"),
+    );
+
+    let response = client
+        .get(url)
+        .headers(headers)
+        .send()
+        .map_err(|err| err.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP {} for {}", response.status(), url));
+    }
+
+    response.json().map_err(|err| err.to_string())
 }
 
 fn post_form_json(url: &str, referer: &str, body: &[(String, String)]) -> Result<Value, String> {
@@ -1411,6 +1448,15 @@ fn is_huya_room_online(data: &HuyaProfileRoomData) -> bool {
     live_status == "ON" || real_live_status == "ON"
 }
 
+fn huya_heat_text(data: &HuyaLiveData) -> String {
+    let total_count = data.total_count.trim();
+    if !total_count.is_empty() {
+        return total_count.to_string();
+    }
+
+    data.activity_count.trim().to_string()
+}
+
 fn fetch_huya_room_state(target: &str) -> Result<ExtractResult, String> {
     let room_id = resolve_huya_room_id(target)?;
     let response = fetch_huya_profile_room(&room_id)?;
@@ -1433,7 +1479,11 @@ fn fetch_huya_room_state(target: &str) -> Result<ExtractResult, String> {
         } else {
             String::new()
         },
-        heat_text: String::new(),
+        heat_text: if is_online {
+            huya_heat_text(&live_data)
+        } else {
+            String::new()
+        },
         page_url: build_huya_live_url(&room_id),
         title: huya_title(&live_data),
         urls: Vec::new(),
@@ -2240,8 +2290,8 @@ fn normalize_player(settings: &Settings) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_player, is_huya_room_online, normalize_danmaku_font_size, normalize_player,
-        HuyaProfileRoomResponse, Settings,
+        default_player, huya_heat_text, is_huya_room_online, normalize_danmaku_font_size,
+        normalize_player, HuyaProfileRoomResponse, Settings,
     };
 
     #[test]
@@ -2286,6 +2336,35 @@ mod tests {
         .expect("huya response should deserialize");
 
         assert!(is_huya_room_online(&response.data));
+    }
+
+    #[test]
+    fn parses_huya_heat_from_total_count() {
+        let response: HuyaProfileRoomResponse = serde_json::from_value(serde_json::json!({
+            "data": {
+                "liveData": {
+                    "totalCount": 237519,
+                    "activityCount": 4757927
+                }
+            }
+        }))
+        .expect("huya response should deserialize");
+
+        assert_eq!(huya_heat_text(&response.data.live_data), "237519");
+    }
+
+    #[test]
+    fn falls_back_huya_heat_to_activity_count() {
+        let response: HuyaProfileRoomResponse = serde_json::from_value(serde_json::json!({
+            "data": {
+                "liveData": {
+                    "activityCount": "4757927"
+                }
+            }
+        }))
+        .expect("huya response should deserialize");
+
+        assert_eq!(huya_heat_text(&response.data.live_data), "4757927");
     }
 }
 
@@ -3379,7 +3458,7 @@ fn search_douyu_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, String> 
         }
 
         let is_online = anchor.is_live == 1;
-        let mut result = SearchStreamer {
+        let result = SearchStreamer {
             name,
             platform: PLATFORM_DOUYU.to_string(),
             target: room_id.clone(),
@@ -3391,19 +3470,44 @@ fn search_douyu_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, String> 
             heat_text: String::new(),
         };
 
-        if result.is_online {
-            if let Ok(meta) = get_room_meta(&result.room_id) {
-                if !meta.screenshot_url.trim().is_empty() {
-                    result.screenshot_url = meta.screenshot_url;
-                }
-                result.heat_text = meta.heat_text;
-            }
-        }
-
         results.push(result);
     }
 
+    let online_room_ids = results
+        .iter()
+        .filter(|result| result.is_online)
+        .map(|result| result.room_id.clone())
+        .collect::<Vec<_>>();
+    let room_metas = fetch_douyu_room_metas_parallel(&online_room_ids);
+    for result in results.iter_mut().filter(|result| result.is_online) {
+        if let Some(meta) = room_metas.get(&result.room_id) {
+            if !meta.screenshot_url.trim().is_empty() {
+                result.screenshot_url = meta.screenshot_url.clone();
+            }
+            result.heat_text = meta.heat_text.clone();
+        }
+    }
+
     Ok(results)
+}
+
+fn fetch_douyu_room_metas_parallel(room_ids: &[String]) -> HashMap<String, RoomMeta> {
+    let handles = room_ids
+        .iter()
+        .filter(|room_id| !room_id.trim().is_empty())
+        .cloned()
+        .map(|room_id| {
+            std::thread::spawn(move || {
+                let meta = get_room_meta(&room_id).ok()?;
+                Some((room_id, meta))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    handles
+        .into_iter()
+        .filter_map(|handle| handle.join().ok().flatten())
+        .collect()
 }
 
 fn search_bilibili_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, String> {
@@ -3426,7 +3530,7 @@ fn search_bilibili_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, Strin
             continue;
         }
         let room_id = item.roomid.trim().to_string();
-        let avatar_url = resolve_bilibili_avatar(&room_id, "", &item.uface, "");
+        let avatar_url = normalize_remote_image_url(&item.uface);
         let room_info = room_infos
             .get(&room_id)
             .or_else(|| room_infos.values().find(|info| info.short_id == room_id));
@@ -3712,9 +3816,10 @@ fn fetch_bilibili_room_base_infos(
         "https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo?{}&req_biz=web_room_componet",
         ids.join("&")
     );
-    let response: BilibiliRoomBaseInfoResponse =
-        serde_json::from_value(fetch_bilibili_json(&url, "https://live.bilibili.com/", "")?)
-            .map_err(|err| err.to_string())?;
+    let response: BilibiliRoomBaseInfoResponse = serde_json::from_value(
+        fetch_bilibili_public_json(&url, "https://live.bilibili.com/")?,
+    )
+    .map_err(|err| err.to_string())?;
     Ok(response.data.by_room_ids)
 }
 
