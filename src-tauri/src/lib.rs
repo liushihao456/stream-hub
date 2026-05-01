@@ -40,9 +40,13 @@ use block2::RcBlock;
 #[cfg(target_os = "macos")]
 use objc2::runtime::AnyObject;
 #[cfg(target_os = "macos")]
+use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
 use objc2::{class, msg_send};
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+use objc2_app_kit::{
+    NSEvent, NSEventMask, NSEventModifierFlags, NSApplicationActivationOptions, NSRunningApplication,
+};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSHTTPCookie, NSString};
 #[cfg(target_os = "macos")]
@@ -64,6 +68,8 @@ const PLATFORM_HUYA: &str = "huya";
 const PLATFORM_DOUYIN_LIVE: &str = "douyin_live";
 const HUYA_SEARCH_STATUS_LIMIT: usize = 6;
 const DOUYIN_SEARCH_VERIFY_LIMIT: usize = 5;
+const PLAYBACK_FULLSCREEN_CHANGED_EVENT: &str = "playback-fullscreen-changed";
+static PLAYBACK_SHORTCUTS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn default_streamer_platform() -> String {
     PLATFORM_DOUYU.to_string()
@@ -2199,6 +2205,58 @@ fn configure_main_webview_transparency<R: tauri::Runtime>(
         .map_err(|err| format!("配置主窗口 WebView 透明背景失败：{err}"))
 }
 
+#[cfg(target_os = "macos")]
+fn install_playback_key_monitor(app: &AppHandle) {
+    let app = app.clone();
+    let block = Box::leak(Box::new(RcBlock::new(
+        move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
+            let event = unsafe { event_ptr.as_ref() };
+            if !PLAYBACK_SHORTCUTS_ACTIVE.load(Ordering::Acquire)
+                || !is_playback_fullscreen_key_event(event)
+            {
+                return event_ptr.as_ptr();
+            }
+
+            if let Some(window) = app.get_webview_window("main") {
+                let next_fullscreen = !window.is_fullscreen().unwrap_or(false);
+                match window.set_fullscreen(next_fullscreen) {
+                    Ok(()) => {
+                        let _ = app.emit(PLAYBACK_FULLSCREEN_CHANGED_EVENT, next_fullscreen);
+                    }
+                    Err(err) => {
+                        let _ = app.emit(
+                            "embedded-player-error",
+                            format!("切换全屏失败：{err}"),
+                        );
+                    }
+                }
+            }
+
+            std::ptr::null_mut()
+        },
+    )));
+
+    unsafe {
+        if let Some(monitor) =
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &**block)
+        {
+            let _ = Retained::into_raw(monitor);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_playback_fullscreen_key_event(event: &NSEvent) -> bool {
+    if event.isARepeat() || event.keyCode() != 3 {
+        return false;
+    }
+
+    let flags = event.modifierFlags();
+    let blocked_modifiers =
+        NSEventModifierFlags::Command | NSEventModifierFlags::Control | NSEventModifierFlags::Option;
+    !flags.intersects(blocked_modifiers)
+}
+
 fn save_bilibili_cookie_and_notify(app: &AppHandle, cookie: String) -> Result<Settings, String> {
     let mut settings = load_settings_inner(app)?;
     settings.bilibili_cookie = cookie;
@@ -4269,12 +4327,18 @@ fn embedded_player_command(
         .command(&app, command)
 }
 
+#[tauri::command]
+fn set_playback_shortcuts_active(active: bool) {
+    PLAYBACK_SHORTCUTS_ACTIVE.store(active, Ordering::Release);
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             #[cfg(target_os = "macos")]
             if let Some(window) = app.get_webview_window("main") {
                 configure_main_webview_transparency(&window)?;
+                install_playback_key_monitor(app.handle());
             }
 
             Ok(())
@@ -4301,7 +4365,8 @@ pub fn run() {
             ensure_danmaku_server,
             embedded_player_set_bounds,
             embedded_player_get_state,
-            embedded_player_command
+            embedded_player_command,
+            set_playback_shortcuts_active
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

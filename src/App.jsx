@@ -18,6 +18,7 @@ const DANMAKU_EXIT_PADDING_PX = 64;
 const DANMAKU_ROW_GAP_PX = 96;
 const DANMAKU_MAX_FLUSH_PER_FRAME = 6;
 const DANMAKU_MAX_PENDING_TEXTS = 120;
+const IS_MAC_PLATFORM = typeof navigator !== "undefined" && /Mac/.test(navigator.platform);
 const emptyEmbeddedPlayerState = {
   phase: "idle",
   title: "",
@@ -113,6 +114,84 @@ function LeftChevronIcon() {
         strokeLinecap="round"
         strokeLinejoin="round"
       />
+    </svg>
+  );
+}
+
+function FullscreenIcon({ active }) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="playback-fullscreen-icon">
+      {active ? (
+        <>
+          <path
+            d="M9.5 4.75v4.75H4.75"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          <path
+            d="m4.75 4.75 4.75 4.75"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          <path
+            d="M14.5 19.25V14.5h4.75"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          <path
+            d="m19.25 19.25-4.75-4.75"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </>
+      ) : (
+        <>
+          <path
+            d="M4.75 9.5V4.75H9.5"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          <path
+            d="m4.75 4.75 5 5"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          <path
+            d="M19.25 14.5v4.75H14.5"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          <path
+            d="m19.25 19.25-5-5"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </>
+      )}
     </svg>
   );
 }
@@ -349,8 +428,10 @@ function StreamerGroup({
 }
 
 function PlaybackPage({
+  pageRef,
   surfaceRef,
   controlsVisible,
+  fullscreenActive,
   playbackTitle,
   playbackPositionSeconds,
   playbackTrackStartSeconds,
@@ -362,7 +443,9 @@ function PlaybackPage({
   danmakuItems,
   danmakuFontSize,
   onBack,
+  onToggleFullscreen,
   onPointerMove,
+  onStageDoubleClick,
   onTrackPointerDown,
   onTrackPointerMove,
   onTrackPointerUp,
@@ -385,11 +468,20 @@ function PlaybackPage({
     : 0;
 
   return (
-    <main className="playback-page" onPointerMove={onPointerMove}>
+    <main
+      ref={pageRef}
+      className="playback-page"
+      tabIndex={-1}
+      onPointerMove={onPointerMove}
+      onPointerDown={() => {
+        pageRef.current?.focus?.({ preventScroll: true });
+      }}
+    >
       <div
         ref={surfaceRef}
         className="playback-stage"
         aria-label="直播画面区域"
+        onDoubleClick={onStageDoubleClick}
       >
         <div className="playback-danmaku-layer" aria-hidden="true">
           {danmakuItems.map(item => (
@@ -417,6 +509,15 @@ function PlaybackPage({
         title="返回"
       >
         <LeftChevronIcon />
+      </button>
+      <button
+        type="button"
+        className={`playback-fullscreen-button ${controlsVisible ? "visible" : ""}`}
+        onClick={onToggleFullscreen}
+        aria-label={fullscreenActive ? "退出全屏" : "进入全屏"}
+        title={fullscreenActive ? "退出全屏" : "进入全屏"}
+      >
+        <FullscreenIcon active={fullscreenActive} />
       </button>
       <div className={`playback-track-region ${controlsVisible ? "visible" : ""}`}>
         <div className="playback-track-gradient" aria-hidden="true" />
@@ -488,9 +589,11 @@ function App() {
   const [embeddedPlayer, setEmbeddedPlayer] = useState(emptyEmbeddedPlayerState);
   const [viewMode, setViewMode] = useState("browse");
   const [playbackBackVisible, setPlaybackBackVisible] = useState(false);
+  const [playbackFullscreen, setPlaybackFullscreen] = useState(false);
   const [currentPlaybackStreamer, setCurrentPlaybackStreamer] = useState(null);
   const [danmakuItems, setDanmakuItems] = useState([]);
   const [playbackSeekDraftSeconds, setPlaybackSeekDraftSeconds] = useState(null);
+  const playbackPageRef = useRef(null);
   const playerSurfaceRef = useRef(null);
   const boundsFrameRef = useRef(0);
   const lastBoundsRef = useRef("");
@@ -506,6 +609,10 @@ function App() {
   const playbackStatePollInFlightRef = useRef(false);
   const playbackExitInFlightRef = useRef(false);
   const playbackAwaitingStartRef = useRef(false);
+  const playbackFullscreenRef = useRef(false);
+  const playbackFullscreenCommandInFlightRef = useRef(false);
+  const playbackFullscreenToggleQueuedRef = useRef(false);
+  const playbackFocusTimersRef = useRef([]);
   const danmakuSocketRef = useRef(null);
   const danmakuTimersRef = useRef(new Map());
   const danmakuRowAvailabilityRef = useRef([]);
@@ -542,6 +649,92 @@ function App() {
     if (playbackControlsHoldCountRef.current === 0) {
       schedulePlaybackBackHide();
     }
+  }
+
+  function clearPlaybackFocusTimers() {
+    for (const timer of playbackFocusTimersRef.current) {
+      window.clearTimeout(timer);
+    }
+    playbackFocusTimersRef.current = [];
+  }
+
+  function focusPlaybackPage() {
+    const page = playbackPageRef.current;
+    if (!page) {
+      return;
+    }
+
+    page.focus?.({ preventScroll: true });
+  }
+
+  function schedulePlaybackFocusRefresh() {
+    clearPlaybackFocusTimers();
+    focusPlaybackPage();
+    playbackFocusTimersRef.current = [120, 360, 900].map(delay => (
+      window.setTimeout(() => {
+        if (document.documentElement.classList.contains("playback-mode")) {
+          focusPlaybackPage();
+        }
+      }, delay)
+    ));
+  }
+
+  function setNativePlaybackShortcutsActive(active) {
+    void invoke("set_playback_shortcuts_active", { active }).catch(() => {});
+  }
+
+  async function setPlaybackFullscreenMode(value, { reportError = true } = {}) {
+    const nextValue = Boolean(value);
+    try {
+      const next = await invoke("embedded_player_command", {
+        command: { kind: "setFullscreen", value: nextValue },
+      });
+      setEmbeddedPlayer(next);
+      playbackFullscreenRef.current = nextValue;
+      setPlaybackFullscreen(nextValue);
+      return true;
+    } catch (err) {
+      if (reportError) {
+        setError(String(err));
+      }
+      return false;
+    }
+  }
+
+  async function togglePlaybackFullscreen() {
+    if (playbackFullscreenCommandInFlightRef.current) {
+      playbackFullscreenToggleQueuedRef.current = true;
+      return;
+    }
+
+    playbackFullscreenCommandInFlightRef.current = true;
+    schedulePlaybackFocusRefresh();
+    revealPlaybackControls();
+    try {
+      await setPlaybackFullscreenMode(!playbackFullscreenRef.current);
+    } finally {
+      playbackFullscreenCommandInFlightRef.current = false;
+      schedulePlaybackFocusRefresh();
+      if (playbackFullscreenToggleQueuedRef.current) {
+        playbackFullscreenToggleQueuedRef.current = false;
+        window.setTimeout(() => {
+          if (document.documentElement.classList.contains("playback-mode")) {
+            void togglePlaybackFullscreen();
+          }
+        }, 0);
+      }
+    }
+  }
+
+  async function handlePlaybackEscapeKey() {
+    if (playbackFullscreenRef.current) {
+      await setPlaybackFullscreenMode(false);
+      schedulePlaybackFocusRefresh();
+      revealPlaybackControls();
+      return;
+    }
+
+    await exitPlaybackView({ stopPlayback: true });
   }
 
   function normalizeDanmakuFontSize(value) {
@@ -672,16 +865,21 @@ function App() {
 
   function restoreBrowseView() {
     playbackAwaitingStartRef.current = false;
+    setNativePlaybackShortcutsActive(false);
     clearPlaybackBackHideTimer();
+    clearPlaybackFocusTimers();
     playbackControlsHoldCountRef.current = 0;
     playbackPointerPositionRef.current = { x: null, y: null };
     playbackTrackPointerIdRef.current = null;
     playbackTrackDraggingRef.current = false;
     playbackStatePollInFlightRef.current = false;
+    playbackFullscreenToggleQueuedRef.current = false;
     clearDanmakuState();
     setCurrentPlaybackStreamer(null);
     setPlaybackSeekDraftSeconds(null);
     setPlaybackBackVisible(false);
+    playbackFullscreenRef.current = false;
+    setPlaybackFullscreen(false);
     setViewMode("browse");
     setActiveTab(playbackOriginRef.current.activeTab);
     restoreScrollRef.current = playbackOriginRef.current.scrollY;
@@ -709,6 +907,12 @@ function App() {
 
     playbackPointerPositionRef.current = { x: nextX, y: nextY };
     revealPlaybackControls();
+  }
+
+  function handlePlaybackStageDoubleClick(event) {
+    event.preventDefault();
+    focusPlaybackPage();
+    void togglePlaybackFullscreen();
   }
 
   function getPlaybackTrackRange() {
@@ -888,6 +1092,7 @@ function App() {
 
   function enterPlaybackView() {
     playbackAwaitingStartRef.current = true;
+    setNativePlaybackShortcutsActive(true);
     playbackOriginRef.current = {
       activeTab,
       scrollY: window.scrollY || window.pageYOffset || 0,
@@ -899,6 +1104,7 @@ function App() {
     playbackTrackPointerIdRef.current = null;
     playbackTrackDraggingRef.current = false;
     playbackStatePollInFlightRef.current = false;
+    playbackFullscreenToggleQueuedRef.current = false;
     setPlaybackSeekDraftSeconds(null);
     setPlaybackBackVisible(false);
     setViewMode("playback");
@@ -912,6 +1118,9 @@ function App() {
     playbackExitInFlightRef.current = true;
 
     try {
+      if (playbackFullscreenRef.current) {
+        await setPlaybackFullscreenMode(false, { reportError: false });
+      }
       if (stopPlayback) {
         const next = await invoke("embedded_player_command", {
           command: { kind: "stop" },
@@ -956,6 +1165,7 @@ function App() {
     let unlistenError;
     let unlistenEmbeddedState;
     let unlistenEmbeddedError;
+    let unlistenPlaybackFullscreenChanged;
 
     async function bootstrap() {
       try {
@@ -981,6 +1191,13 @@ function App() {
         });
         unlistenEmbeddedError = await listen("embedded-player-error", event => {
           setError(String(event.payload));
+        });
+        unlistenPlaybackFullscreenChanged = await listen("playback-fullscreen-changed", event => {
+          const active = Boolean(event.payload);
+          playbackFullscreenRef.current = active;
+          setPlaybackFullscreen(active);
+          schedulePlaybackFocusRefresh();
+          revealPlaybackControls();
         });
 
         const [savedStreamers, savedSettings, embeddedState] = await Promise.all([
@@ -1022,12 +1239,15 @@ function App() {
       unlistenError?.();
       unlistenEmbeddedState?.();
       unlistenEmbeddedError?.();
+      unlistenPlaybackFullscreenChanged?.();
     };
   }, []);
 
   useEffect(() => {
     return () => {
+      setNativePlaybackShortcutsActive(false);
       clearPlaybackBackHideTimer();
+      clearPlaybackFocusTimers();
       clearDanmakuState();
       const socket = danmakuSocketRef.current;
       danmakuSocketRef.current = null;
@@ -1075,10 +1295,40 @@ function App() {
       return undefined;
     }
 
+    const frame = window.requestAnimationFrame(() => {
+      schedulePlaybackFocusRefresh();
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      clearPlaybackFocusTimers();
+    };
+  }, [viewMode]);
+
+  useEffect(() => {
+    if (viewMode !== "playback") {
+      return undefined;
+    }
+
     function handleKeyDown(event) {
       if (event.key === "Escape") {
         event.preventDefault();
-        void exitPlaybackView({ stopPlayback: true });
+        void handlePlaybackEscapeKey();
+        return;
+      }
+
+      const key = typeof event.key === "string" ? event.key.toLowerCase() : "";
+      const code = typeof event.code === "string" ? event.code : "";
+      if (
+        !IS_MAC_PLATFORM
+        && (key === "f" || code === "KeyF")
+        && !event.repeat
+        && !event.metaKey
+        && !event.ctrlKey
+        && !event.altKey
+      ) {
+        event.preventDefault();
+        void togglePlaybackFullscreen();
         return;
       }
 
@@ -1095,9 +1345,9 @@ function App() {
       }
     }
 
-    window.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("keydown", handleKeyDown, true);
     return () => {
-      window.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("keydown", handleKeyDown, true);
     };
   }, [
     viewMode,
@@ -1569,8 +1819,10 @@ function App() {
 
     return (
       <PlaybackPage
+        pageRef={playbackPageRef}
         surfaceRef={playerSurfaceRef}
         controlsVisible={playbackBackVisible}
+        fullscreenActive={playbackFullscreen}
         playbackTitle={playbackTitle}
         playbackPositionSeconds={playbackTrackPosition}
         playbackTrackStartSeconds={playbackTrackRange.start}
@@ -1584,7 +1836,11 @@ function App() {
         onBack={() => {
           void exitPlaybackView({ stopPlayback: true });
         }}
+        onToggleFullscreen={() => {
+          void togglePlaybackFullscreen();
+        }}
         onPointerMove={handlePlaybackPointerMove}
+        onStageDoubleClick={handlePlaybackStageDoubleClick}
         onTrackPointerDown={handlePlaybackTrackPointerDown}
         onTrackPointerMove={handlePlaybackTrackPointerMove}
         onTrackPointerUp={handlePlaybackTrackPointerUp}
