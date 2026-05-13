@@ -17,13 +17,15 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::ffi::CString;
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
 const PLAYER_EVENT_ERROR: &str = "embedded-player-error";
 const RTLD_LAZY: i32 = 0x1;
+const MIN_RENDER_INTERVAL_MICROS: u64 = 16_000;
 
 unsafe extern "C" {
     fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
@@ -47,6 +49,7 @@ struct RenderCallbackState {
     visible: AtomicBool,
     width: AtomicI32,
     height: AtomicI32,
+    last_render_micros: AtomicU64,
 }
 
 impl MacHost {
@@ -161,6 +164,7 @@ impl MacHost {
             visible: AtomicBool::new(false),
             width: AtomicI32::new(1),
             height: AtomicI32::new(1),
+            last_render_micros: AtomicU64::new(0),
         });
         let state_ptr = (&*state) as *const RenderCallbackState as usize;
         let mpv_ptr = mpv as usize;
@@ -360,6 +364,10 @@ fn schedule_render(state: &RenderCallbackState) {
     if state.pending.swap(true, Ordering::AcqRel) {
         return;
     }
+    if !reserve_render_slot(state) {
+        state.pending.store(false, Ordering::Release);
+        return;
+    }
 
     let state_ptr = state as *const RenderCallbackState as usize;
     if let Some(window) = state.app.get_webview_window("main") {
@@ -426,6 +434,24 @@ unsafe fn render_on_main_thread(state: &RenderCallbackState) {
 
     let _: () = msg_send![gl_context, flushBuffer];
     mpv_render_context_report_swap(render_context);
+}
+
+fn reserve_render_slot(state: &RenderCallbackState) -> bool {
+    let now = current_time_micros();
+    let previous = state.last_render_micros.load(Ordering::Acquire);
+    if previous > 0 && now.saturating_sub(previous) < MIN_RENDER_INTERVAL_MICROS {
+        return false;
+    }
+
+    state.last_render_micros.store(now, Ordering::Release);
+    true
+}
+
+fn current_time_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 unsafe extern "C" fn get_proc_address(_ctx: *mut c_void, name: *const c_char) -> *mut c_void {

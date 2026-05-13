@@ -38,14 +38,15 @@ mod player;
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
 #[cfg(target_os = "macos")]
-use objc2::runtime::AnyObject;
-#[cfg(target_os = "macos")]
 use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
+use objc2::runtime::AnyObject;
 #[cfg(target_os = "macos")]
 use objc2::{class, msg_send};
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
-    NSEvent, NSEventMask, NSEventModifierFlags, NSApplicationActivationOptions, NSRunningApplication,
+    NSApplicationActivationOptions, NSEvent, NSEventMask, NSEventModifierFlags,
+    NSRunningApplication,
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSHTTPCookie, NSString};
@@ -1805,8 +1806,19 @@ fn select_bilibili_codec<'a>(
 }
 
 fn select_bilibili_urls(playurl: &BilibiliPlayurl) -> Vec<String> {
-    let codec = select_bilibili_codec(playurl, "http_stream", "flv", "avc")
-        .or_else(|| select_bilibili_codec(playurl, "http_hls", "fmp4", "avc"));
+    let codec_preferences = [
+        ("http_hls", "fmp4", "avc"),
+        ("http_hls", "ts", "avc"),
+        ("http_stream", "flv", "avc"),
+        ("http_hls", "fmp4", "hevc"),
+        ("http_hls", "ts", "hevc"),
+        ("http_stream", "flv", "hevc"),
+    ];
+    let codec = codec_preferences
+        .iter()
+        .find_map(|(protocol, format, codec)| {
+            select_bilibili_codec(playurl, protocol, format, codec)
+        });
 
     codec
         .map(|codec| reorder_bilibili_urls(bilibili_codec_urls(codec)))
@@ -2224,10 +2236,7 @@ fn install_playback_key_monitor(app: &AppHandle) {
                         let _ = app.emit(PLAYBACK_FULLSCREEN_CHANGED_EVENT, next_fullscreen);
                     }
                     Err(err) => {
-                        let _ = app.emit(
-                            "embedded-player-error",
-                            format!("切换全屏失败：{err}"),
-                        );
+                        let _ = app.emit("embedded-player-error", format!("切换全屏失败：{err}"));
                     }
                 }
             }
@@ -2252,8 +2261,9 @@ fn is_playback_fullscreen_key_event(event: &NSEvent) -> bool {
     }
 
     let flags = event.modifierFlags();
-    let blocked_modifiers =
-        NSEventModifierFlags::Command | NSEventModifierFlags::Control | NSEventModifierFlags::Option;
+    let blocked_modifiers = NSEventModifierFlags::Command
+        | NSEventModifierFlags::Control
+        | NSEventModifierFlags::Option;
     !flags.intersects(blocked_modifiers)
 }
 
@@ -2349,8 +2359,33 @@ fn normalize_player(settings: &Settings) -> String {
 mod tests {
     use super::{
         default_player, huya_heat_text, is_huya_room_online, normalize_danmaku_font_size,
-        normalize_player, HuyaProfileRoomResponse, Settings,
+        normalize_player, select_bilibili_urls, BilibiliPlayCodec, BilibiliPlayFormat,
+        BilibiliPlayStream, BilibiliPlayurl, BilibiliUrlInfo, HuyaProfileRoomResponse, Settings,
     };
+
+    fn bilibili_codec(
+        protocol: &str,
+        format: &str,
+        codec: &str,
+        base_url: &str,
+    ) -> BilibiliPlayStream {
+        BilibiliPlayStream {
+            protocol_name: protocol.to_string(),
+            formats: vec![BilibiliPlayFormat {
+                format_name: format.to_string(),
+                codecs: vec![BilibiliPlayCodec {
+                    codec_name: codec.to_string(),
+                    current_qn: 250,
+                    accept_qn: vec![250],
+                    base_url: base_url.to_string(),
+                    url_info: vec![BilibiliUrlInfo {
+                        host: "https://example.bilivideo.com".to_string(),
+                        extra: "?token=test".to_string(),
+                    }],
+                }],
+            }],
+        }
+    }
 
     #[test]
     fn normalize_player_accepts_libmpv() {
@@ -2423,6 +2458,42 @@ mod tests {
         .expect("huya response should deserialize");
 
         assert_eq!(huya_heat_text(&response.data.live_data), "4757927");
+    }
+
+    #[test]
+    fn bilibili_play_urls_prefer_hls_fmp4_over_flv() {
+        let playurl = BilibiliPlayurl {
+            stream: vec![
+                bilibili_codec("http_stream", "flv", "avc", "/live/test.flv"),
+                bilibili_codec("http_hls", "fmp4", "avc", "/live/test/index.m3u8"),
+            ],
+        };
+
+        let urls = select_bilibili_urls(&playurl);
+
+        assert_eq!(
+            urls.first().map(String::as_str),
+            Some("https://example.bilivideo.com/live/test/index.m3u8?token=test")
+        );
+    }
+
+    #[test]
+    fn bilibili_play_urls_fall_back_to_flv_when_hls_missing() {
+        let playurl = BilibiliPlayurl {
+            stream: vec![bilibili_codec(
+                "http_stream",
+                "flv",
+                "avc",
+                "/live/test.flv",
+            )],
+        };
+
+        let urls = select_bilibili_urls(&playurl);
+
+        assert_eq!(
+            urls.first().map(String::as_str),
+            Some("https://example.bilivideo.com/live/test.flv?token=test")
+        );
     }
 }
 
