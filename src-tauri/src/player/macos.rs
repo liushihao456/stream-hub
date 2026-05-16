@@ -20,7 +20,8 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
 const PLAYER_EVENT_ERROR: &str = "embedded-player-error";
@@ -364,21 +365,53 @@ fn schedule_render(state: &RenderCallbackState) {
     if state.pending.swap(true, Ordering::AcqRel) {
         return;
     }
-    if !reserve_render_slot(state) {
-        state.pending.store(false, Ordering::Release);
+
+    let state_ptr = state as *const RenderCallbackState as usize;
+    let delay_micros = render_delay_micros(state);
+    if delay_micros > 0 {
+        let app = state.app.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_micros(delay_micros));
+            queue_render_on_main_thread(app, state_ptr);
+        });
         return;
     }
 
-    let state_ptr = state as *const RenderCallbackState as usize;
-    if let Some(window) = state.app.get_webview_window("main") {
-        let _ = window.run_on_main_thread(move || unsafe {
+    queue_render_on_main_thread(state.app.clone(), state_ptr);
+}
+
+fn queue_render_on_main_thread(app: AppHandle, state_ptr: usize) {
+    let Some(window) = app.get_webview_window("main") else {
+        unsafe {
             let state = &*(state_ptr as *const RenderCallbackState);
             state.pending.store(false, Ordering::Release);
-            render_on_main_thread(state);
-        });
-    } else {
+        }
+        return;
+    };
+
+    let result = window.run_on_main_thread(move || unsafe {
+        let state = &*(state_ptr as *const RenderCallbackState);
+        render_on_main_thread(state);
         state.pending.store(false, Ordering::Release);
+    });
+
+    if result.is_err() {
+        unsafe {
+            let state = &*(state_ptr as *const RenderCallbackState);
+            state.pending.store(false, Ordering::Release);
+        }
     }
+}
+
+fn render_delay_micros(state: &RenderCallbackState) -> u64 {
+    let now = current_time_micros();
+    let previous = state.last_render_micros.load(Ordering::Acquire);
+    if previous == 0 {
+        return 0;
+    }
+
+    let elapsed = now.saturating_sub(previous);
+    MIN_RENDER_INTERVAL_MICROS.saturating_sub(elapsed)
 }
 
 unsafe fn render_on_main_thread(state: &RenderCallbackState) {
@@ -393,6 +426,10 @@ unsafe fn render_on_main_thread(state: &RenderCallbackState) {
     if update_flags & (mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) == 0 {
         return;
     }
+
+    state
+        .last_render_micros
+        .store(current_time_micros(), Ordering::Release);
 
     let width = state.width.load(Ordering::Acquire).max(1);
     let height = state.height.load(Ordering::Acquire).max(1);
@@ -434,17 +471,6 @@ unsafe fn render_on_main_thread(state: &RenderCallbackState) {
 
     let _: () = msg_send![gl_context, flushBuffer];
     mpv_render_context_report_swap(render_context);
-}
-
-fn reserve_render_slot(state: &RenderCallbackState) -> bool {
-    let now = current_time_micros();
-    let previous = state.last_render_micros.load(Ordering::Acquire);
-    if previous > 0 && now.saturating_sub(previous) < MIN_RENDER_INTERVAL_MICROS {
-        return false;
-    }
-
-    state.last_render_micros.store(now, Ordering::Release);
-    true
 }
 
 fn current_time_micros() -> u64 {
