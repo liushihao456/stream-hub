@@ -445,6 +445,7 @@ function PlaybackPage({
   onBack,
   onToggleFullscreen,
   onPointerMove,
+  onPointerLeave,
   onStageDoubleClick,
   onTrackPointerDown,
   onTrackPointerMove,
@@ -473,6 +474,7 @@ function PlaybackPage({
       className="playback-page"
       tabIndex={-1}
       onPointerMove={onPointerMove}
+      onPointerLeave={onPointerLeave}
       onPointerDown={() => {
         pageRef.current?.focus?.({ preventScroll: true });
       }}
@@ -893,6 +895,14 @@ function App() {
     schedulePlaybackBackHide();
   }
 
+  function hidePlaybackControls() {
+    clearPlaybackBackHideTimer();
+    playbackPointerPositionRef.current = { x: null, y: null };
+    if (playbackControlsHoldCountRef.current === 0) {
+      setPlaybackBackVisible(false);
+    }
+  }
+
   function handlePlaybackPointerMove(event) {
     if (viewMode !== "playback") {
       return;
@@ -907,6 +917,19 @@ function App() {
 
     playbackPointerPositionRef.current = { x: nextX, y: nextY };
     revealPlaybackControls();
+  }
+
+  function handlePlaybackPointerLeave(event) {
+    if (viewMode !== "playback") {
+      return;
+    }
+
+    const relatedTarget = event.relatedTarget;
+    if (relatedTarget instanceof Node && event.currentTarget.contains(relatedTarget)) {
+      return;
+    }
+
+    hidePlaybackControls();
   }
 
   function handlePlaybackStageDoubleClick(event) {
@@ -1302,6 +1325,34 @@ function App() {
     return () => {
       window.cancelAnimationFrame(frame);
       clearPlaybackFocusTimers();
+    };
+  }, [viewMode]);
+
+  useEffect(() => {
+    if (viewMode !== "playback") {
+      return undefined;
+    }
+
+    function handleWindowPointerOut(event) {
+      if (event.relatedTarget == null) {
+        hidePlaybackControls();
+      }
+    }
+
+    function handleWindowBlur() {
+      hidePlaybackControls();
+    }
+
+    window.addEventListener("pointerout", handleWindowPointerOut, true);
+    window.addEventListener("mouseout", handleWindowPointerOut, true);
+    window.addEventListener("blur", handleWindowBlur);
+    document.documentElement.addEventListener("mouseleave", handleWindowBlur);
+
+    return () => {
+      window.removeEventListener("pointerout", handleWindowPointerOut, true);
+      window.removeEventListener("mouseout", handleWindowPointerOut, true);
+      window.removeEventListener("blur", handleWindowBlur);
+      document.documentElement.removeEventListener("mouseleave", handleWindowBlur);
     };
   }, [viewMode]);
 
@@ -1840,6 +1891,7 @@ function App() {
           void togglePlaybackFullscreen();
         }}
         onPointerMove={handlePlaybackPointerMove}
+        onPointerLeave={handlePlaybackPointerLeave}
         onStageDoubleClick={handlePlaybackStageDoubleClick}
         onTrackPointerDown={handlePlaybackTrackPointerDown}
         onTrackPointerMove={handlePlaybackTrackPointerMove}
