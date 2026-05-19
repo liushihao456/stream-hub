@@ -437,7 +437,6 @@ function PlaybackPage({
   playbackTrackStartSeconds,
   playbackTrackEndSeconds,
   playbackTrackMode,
-  playbackIsAtLiveEdge,
   playbackSeekable,
   playbackTrackDragging,
   danmakuItems,
@@ -464,9 +463,6 @@ function PlaybackPage({
       ? `${((normalizedPosition - trackStart) / normalizedDuration) * 100}%`
       : "100%";
   const isLiveCacheTrack = playbackTrackMode === "live-cache";
-  const liveOffsetSeconds = isLiveCacheTrack
-    ? Math.max(0, trackEnd - normalizedPosition)
-    : 0;
 
   return (
     <main
@@ -527,13 +523,12 @@ function PlaybackPage({
           <div className="playback-track-meta">
             <p className="playback-track-title">{playbackTitle || "正在播放"}</p>
             {isLiveCacheTrack ? (
-              playbackIsAtLiveEdge || liveOffsetSeconds <= 2.5 ? (
+              <span className="playback-track-live-time">
                 <span className="playback-track-live-pill">LIVE</span>
-              ) : (
-                <span className="playback-track-time playback-track-live-offset">
-                  {formatLiveOffset(liveOffsetSeconds)}
+                <span className="playback-track-time">
+                  {formatPlaybackTime(normalizedPosition - trackStart)} / {formatPlaybackTime(normalizedDuration)}
                 </span>
-              )
+              </span>
             ) : playbackSeekable ? (
               <span className="playback-track-time">
                 {formatPlaybackTime(normalizedPosition - trackStart)} / {formatPlaybackTime(normalizedDuration)}
@@ -1879,7 +1874,6 @@ function App() {
         playbackTrackStartSeconds={playbackTrackRange.start}
         playbackTrackEndSeconds={playbackTrackRange.end}
         playbackTrackMode={playbackTrackRange.mode}
-        playbackIsAtLiveEdge={embeddedPlayer.isAtLiveEdge}
         playbackSeekable={playbackSeekable}
         playbackTrackDragging={playbackSeekDraftSeconds != null}
         danmakuItems={danmakuItems}

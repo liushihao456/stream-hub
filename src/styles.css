@@ -285,6 +285,13 @@ button:focus {
   color: rgba(255, 255, 255, 0.92);
 }
 
+.playback-track-live-time {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-shrink: 0;
+}
+
 .playback-track-live-pill {
   flex-shrink: 0;
   padding: 0.2rem 0.62rem;
