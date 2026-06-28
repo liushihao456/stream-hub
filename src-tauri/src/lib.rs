@@ -234,24 +234,25 @@ struct SearchApiUserItem {
     anchor_info: SearchApiAnchorInfo,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 struct SearchApiAnchorInfo {
-    #[serde(rename = "rid", deserialize_with = "deserialize_value_to_string")]
+    #[serde(default, rename = "rid", deserialize_with = "deserialize_value_to_string")]
     room_id: String,
-    #[serde(rename = "nickName")]
+    #[serde(default, rename = "nickName")]
     nick_name: String,
     #[serde(default)]
     description: String,
     #[serde(default)]
     avatar: String,
-    #[serde(default, rename = "roomSrc")]
-    room_src: String,
-    #[serde(default, rename = "isLive")]
-    is_live: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct BilibiliLiveSearchResponse {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
     data: BilibiliLiveSearchData,
 }
 
@@ -955,31 +956,100 @@ pub(crate) fn build_bilibili_cookie_string(raw_cookie: &str) -> Result<Option<St
 
 fn fetch_bilibili_search(keyword: &str) -> Result<Vec<BilibiliLiveSearchItem>, String> {
     let client = bilibili_client()?;
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_str(BILIBILI_USER_AGENT).map_err(|err| err.to_string())?,
-    );
-    headers.insert(
-        REFERER,
-        HeaderValue::from_static("https://www.bilibili.com/"),
-    );
+    let attempts = [
+        (
+            "https://api.bilibili.com/x/web-interface/wbi/search/type",
+            "https://search.bilibili.com/",
+            None,
+        ),
+        (
+            "https://api.bilibili.com/x/web-interface/wbi/search/type",
+            "https://www.bilibili.com/",
+            None,
+        ),
+        (
+            "https://api.bilibili.com/x/web-interface/search/type",
+            "https://www.bilibili.com/",
+            None,
+        ),
+        (
+            "https://api.bilibili.com/x/web-interface/search/type",
+            "https://www.bilibili.com/",
+            Some("https://search.bilibili.com"),
+        ),
+        (
+            "https://api.bilibili.com/x/web-interface/search/type",
+            "https://search.bilibili.com/",
+            None,
+        ),
+    ];
+    let mut last_error = String::new();
 
-    let response: BilibiliLiveSearchResponse = client
-        .get("https://api.bilibili.com/x/web-interface/search/type")
-        .headers(headers)
-        .query(&[
-            ("search_type", "live_user"),
-            ("keyword", keyword),
-            ("order", "online"),
-            ("page", "1"),
-        ])
-        .send()
-        .map_err(|err| err.to_string())?
-        .json()
-        .map_err(|err| err.to_string())?;
+    for (url, referer, origin) in attempts {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(BILIBILI_USER_AGENT).map_err(|err| err.to_string())?,
+        );
+        headers.insert(
+            REFERER,
+            HeaderValue::from_str(referer).map_err(|err| err.to_string())?,
+        );
+        if let Some(origin) = origin {
+            headers.insert(
+                ORIGIN,
+                HeaderValue::from_str(origin).map_err(|err| err.to_string())?,
+            );
+        }
+        headers.insert(
+            "accept",
+            HeaderValue::from_static("application/json, text/plain, */*"),
+        );
 
-    Ok(response.data.result)
+        let response = client
+            .get(url)
+            .headers(headers)
+            .query(&[
+                ("search_type", "live_user"),
+                ("keyword", keyword),
+                ("order", "online"),
+                ("page", "1"),
+                ("page_size", "20"),
+            ])
+            .send()
+            .map_err(|err| err.to_string());
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                last_error = err;
+                continue;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            last_error = format!("HTTP {status} for {url}");
+            continue;
+        }
+        let parsed = response.json::<BilibiliLiveSearchResponse>();
+        let parsed = match parsed {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                last_error = err.to_string();
+                continue;
+            }
+        };
+        if parsed.code != 0 {
+            last_error = format!("Bilibili search error {}: {}", parsed.code, parsed.message);
+            continue;
+        }
+        return Ok(parsed.data.result);
+    }
+
+    Err(if last_error.is_empty() {
+        "Bilibili search failed".to_string()
+    } else {
+        last_error
+    })
 }
 
 fn fetch_bilibili_public_json(url: &str, referer: &str) -> Result<Value, String> {
@@ -3053,7 +3123,6 @@ fn search_douyu_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, String> 
             continue;
         }
 
-        let is_online = anchor.is_live == 1;
         let result = SearchStreamer {
             name,
             platform: PLATFORM_DOUYU.to_string(),
@@ -3061,41 +3130,48 @@ fn search_douyu_streamers(keyword: &str) -> Result<Vec<SearchStreamer>, String> 
             room_id,
             room_name: anchor.description,
             avatar_url: anchor.avatar,
-            is_online,
-            screenshot_url: anchor.room_src,
+            is_online: false,
+            screenshot_url: String::new(),
             heat_text: String::new(),
         };
 
         results.push(result);
     }
 
-    let online_room_ids = results
+    let room_ids = results
         .iter()
-        .filter(|result| result.is_online)
         .map(|result| result.room_id.clone())
         .collect::<Vec<_>>();
-    let room_metas = fetch_douyu_room_metas_parallel(&online_room_ids);
-    for result in results.iter_mut().filter(|result| result.is_online) {
-        if let Some(meta) = room_metas.get(&result.room_id) {
-            if !meta.screenshot_url.trim().is_empty() {
-                result.screenshot_url = meta.screenshot_url.clone();
+    let room_snapshots = fetch_douyu_room_snapshots_parallel(&room_ids);
+    for result in results.iter_mut() {
+        if let Some(snapshot) = room_snapshots.get(&result.room_id) {
+            if !snapshot.streamer_name.trim().is_empty() {
+                result.name = snapshot.streamer_name.clone();
             }
-            result.heat_text = meta.heat_text.clone();
+            if !snapshot.room_name.trim().is_empty() {
+                result.room_name = snapshot.room_name.clone();
+            }
+            if !snapshot.avatar_url.trim().is_empty() {
+                result.avatar_url = snapshot.avatar_url.clone();
+            }
+            result.is_online = snapshot.is_online;
+            result.screenshot_url = snapshot.screenshot_url.clone();
+            result.heat_text = snapshot.heat_text.clone();
         }
     }
 
     Ok(results)
 }
 
-fn fetch_douyu_room_metas_parallel(room_ids: &[String]) -> HashMap<String, RoomMeta> {
+fn fetch_douyu_room_snapshots_parallel(room_ids: &[String]) -> HashMap<String, RoomSnapshot> {
     let handles = room_ids
         .iter()
         .filter(|room_id| !room_id.trim().is_empty())
         .cloned()
         .map(|room_id| {
             std::thread::spawn(move || {
-                let meta = get_room_meta(&room_id).ok()?;
-                Some((room_id, meta))
+                let snapshot = get_room_snapshot(&room_id).ok()?;
+                Some((room_id, snapshot))
             })
         })
         .collect::<Vec<_>>();
