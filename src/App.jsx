@@ -596,79 +596,172 @@ function detectFrontendStreamType(url) {
 	return "flv";
 }
 
+function describePlaybackUrl(url) {
+	try {
+		const parsed = new URL(url);
+		const pathParts = parsed.pathname.split("/").filter(Boolean);
+		const tail = pathParts.slice(-2).join("/") || "/";
+		return `${parsed.protocol}//${parsed.host}/${tail}${parsed.search ? "?..." : ""}`;
+	} catch {
+		return String(url || "").slice(0, 120);
+	}
+}
+
 function FrontendVideoPlayer({ playInfo, onReady, onError }) {
 	const videoRef = useRef(null);
+	const readyFiredRef = useRef(false);
 
 	useEffect(() => {
 		const video = videoRef.current;
-		const url = playInfo?.proxyUrls?.[0] || playInfo?.urls?.[0] || "";
+		const sourceUrl = playInfo?.urls?.[0] || "";
+		let url = playInfo?.proxyUrls?.[0] || sourceUrl;
 		if (!video || !url) {
 			return undefined;
+		}
+
+		const type = detectFrontendStreamType(sourceUrl || url);
+		// HLS proxy URL needs a path suffix so hls.js resolves relative segment URLs correctly
+		if (type === "hls" && url && !url.endsWith("/") && !url.endsWith(".m3u8")) {
+			url = url.replace(/\/?$/, "/") + "index.m3u8";
 		}
 
 		let disposed = false;
 		let player = null;
 		let hls = null;
+		readyFiredRef.current = false;
 
-		async function startNativeVideo(src) {
-			video.src = src;
-			video.load();
-			try {
-				await video.play();
+		console.info("[stream-hub:player] init", {
+			platform: playInfo?.platform,
+			roomId: playInfo?.roomId,
+			type,
+			sourceUrl: describePlaybackUrl(sourceUrl),
+			proxyUrl: describePlaybackUrl(url),
+			urlCount: playInfo?.urls?.length || 0,
+			proxyCount: playInfo?.proxyUrls?.length || 0,
+		});
+
+		function fireReady() {
+			if (!disposed && !readyFiredRef.current) {
+				readyFiredRef.current = true;
+				console.info("[stream-hub:player] ready", {
+					readyState: video.readyState,
+					networkState: video.networkState,
+					currentTime: video.currentTime,
+				});
 				onReady?.();
-			} catch (err) {
-				if (!disposed) {
-					onError?.(`网页播放器启动失败：${String(err)}`);
-				}
 			}
 		}
 
-		const type = detectFrontendStreamType(url);
+		function isAbortError(err) {
+			return err?.name === "AbortError" || String(err).toLowerCase().includes("aborted");
+		}
+
+		function fireError(msg) {
+			if (!disposed) {
+				console.error("[stream-hub:player] fatal", {
+					message: msg,
+					readyState: video.readyState,
+					networkState: video.networkState,
+					error: video.error
+						? {
+							code: video.error.code,
+							message: video.error.message,
+						}
+						: null,
+				});
+				onError?.(`网页播放器启动失败：${msg}`);
+			}
+		}
+
+		function handlePlayPromise(result) {
+			if (result && typeof result.then === "function") {
+				result.then(fireReady).catch((err) => {
+					if (disposed) {
+						return;
+					}
+					if (isAbortError(err)) {
+						console.warn("[stream-hub:player] play promise aborted; waiting for media events", String(err));
+						return;
+					}
+					fireError(String(err));
+				});
+			}
+		}
+
+		const logVideoEvent = (event) => {
+			console.info("[stream-hub:player] video event", {
+				event: event.type,
+				readyState: video.readyState,
+				networkState: video.networkState,
+				currentTime: video.currentTime,
+				error: video.error
+					? { code: video.error.code, message: video.error.message }
+					: null,
+			});
+		};
+		const videoEvents = [
+			"loadstart",
+			"loadedmetadata",
+			"canplay",
+			"playing",
+			"waiting",
+			"stalled",
+			"error",
+		];
+		for (const eventName of videoEvents) {
+			video.addEventListener(eventName, logVideoEvent);
+		}
+		video.addEventListener("playing", fireReady);
+		video.addEventListener("canplay", fireReady);
+
 		if (type === "hls") {
-			if (video.canPlayType("application/vnd.apple.mpegurl")) {
-				void startNativeVideo(url);
-			} else if (Hls.isSupported()) {
+			if (Hls.isSupported()) {
+				console.info("[stream-hub:player] using hls.js");
 				hls = new Hls({ lowLatencyMode: true });
 				hls.on(Hls.Events.ERROR, (_event, data) => {
+					console.error("[stream-hub:player] hls error", data);
 					if (data?.fatal && !disposed) {
-						onError?.(`HLS 播放失败：${data?.details || data?.type || "未知错误"}`);
+						fireError(`HLS 播放失败：${data?.details || data?.type || "未知错误"}`);
 					}
+				});
+				hls.on(Hls.Events.MANIFEST_PARSED, () => {
+					handlePlayPromise(video.play());
 				});
 				hls.loadSource(url);
 				hls.attachMedia(video);
-				video.play()
-					.then(() => onReady?.())
-					.catch((err) => {
-						if (!disposed) {
-							onError?.(`网页播放器启动失败：${String(err)}`);
-						}
-					});
+			} else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+				console.info("[stream-hub:player] using native hls (direct URL)");
+				video.src = sourceUrl;
+				video.load();
+				handlePlayPromise(video.play());
 			} else {
-				onError?.("当前 WebView 不支持 HLS/MSE 播放");
+				fireError("当前 WebView 不支持 HLS/MSE 播放");
 			}
 		} else if (mpegts.getFeatureList?.()?.mseLivePlayback || mpegts.isSupported()) {
+			console.info("[stream-hub:player] using mpegts.js", mpegts.getFeatureList?.());
 			player = mpegts.createPlayer({ type: "flv", isLive: true, url });
-			player.on(mpegts.Events.ERROR, (typeName, detail) => {
+			player.on(mpegts.Events.ERROR, (typeName, detail, info) => {
+				console.error("[stream-hub:player] mpegts error", { typeName, detail, info });
 				if (!disposed) {
-					onError?.(`FLV 播放失败：${typeName || "未知错误"} ${detail || ""}`.trim());
+					fireError(`FLV 播放失败：${typeName || "未知错误"} ${detail || ""}`.trim());
 				}
 			});
 			player.attachMediaElement(video);
 			player.load();
-			video.play()
-				.then(() => onReady?.())
-				.catch((err) => {
-					if (!disposed) {
-						onError?.(`网页播放器启动失败：${String(err)}`);
-					}
-				});
+			handlePlayPromise(player.play?.());
 		} else {
-			onError?.("当前 WebView 不支持 MSE，无法使用网页 FLV 播放器");
+			fireError("当前 WebView 不支持 MSE，无法使用网页 FLV 播放器");
 		}
 
 		return () => {
 			disposed = true;
+			console.info("[stream-hub:player] cleanup");
 			try {
+				for (const eventName of videoEvents) {
+					video.removeEventListener(eventName, logVideoEvent);
+				}
+				video.removeEventListener("playing", fireReady);
+				video.removeEventListener("canplay", fireReady);
 				player?.unload?.();
 				player?.detachMediaElement?.();
 				player?.destroy?.();
@@ -682,7 +775,7 @@ function FrontendVideoPlayer({ playInfo, onReady, onError }) {
 		};
 	}, [playInfo, onReady, onError]);
 
-	return <video ref={videoRef} className="frontend-video" playsInline autoPlay />;
+	return <video ref={videoRef} className="frontend-video" playsInline />;
 }
 
 function App() {

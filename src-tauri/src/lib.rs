@@ -2306,6 +2306,7 @@ fn register_stream_proxy_sessions(
     let mut proxy_urls = Vec::with_capacity(data.urls.len());
     for url in &data.urls {
         let session_id = Uuid::new_v4().to_string();
+        eprintln!("[stream-hub:proxy] register session {} for {}", session_id, url);
         sessions.insert(
             session_id.clone(),
             StreamProxySession {
@@ -2316,6 +2317,7 @@ fn register_stream_proxy_sessions(
         proxy_urls.push(format!("http://127.0.0.1:{port}/stream-proxy/{session_id}"));
     }
 
+    eprintln!("[stream-hub:proxy] total sessions after register: {}", sessions.len());
     Ok(proxy_urls)
 }
 
@@ -2834,7 +2836,17 @@ fn ensure_danmaku_server_running(app: &AppHandle) -> Result<u16, String> {
 async fn run_danmaku_server(listener: TcpListener, state: DanmakuHttpState) {
     let app = Router::new()
         .route("/danmaku-websocket", get(handle_danmaku_websocket))
-        .route("/stream-proxy/{session_id}", get(handle_stream_proxy))
+        .route("/stream-proxy/:session_id", get(handle_stream_proxy))
+        .route("/stream-proxy/:session_id/*path", get(handle_stream_proxy_segment))
+        /* fallback 404 handler - log unmatched paths */
+        .fallback(|req: axum::http::Request<axum::body::Body>| async move {
+            let path = req.uri().path().to_string();
+            let method = req.method().to_string();
+            eprintln!("[stream-hub:proxy] unmatched {} {}", method, path);
+            let mut headers = HeaderMap::new();
+            headers.insert("access-control-allow-origin", AxumHeaderValue::from_static("*"));
+            (StatusCode::NOT_FOUND, headers, format!("no route for {} {}", method, path))
+        })
         .with_state(state);
     let _ = axum::serve(listener, app).await;
 }
@@ -2842,43 +2854,88 @@ async fn run_danmaku_server(listener: TcpListener, state: DanmakuHttpState) {
 async fn handle_stream_proxy(
     State(state): State<DanmakuHttpState>,
     AxumPath(session_id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let session = {
-        let sessions = state.stream_sessions.lock().map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "stream proxy 状态锁已损坏".to_string(),
-            )
-        })?;
-        sessions.get(&session_id).cloned().ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                "stream proxy session 不存在或已过期".to_string(),
-            )
-        })?
+) -> impl IntoResponse {
+    proxy_stream(&state, &session_id, "").await
+}
+
+async fn handle_stream_proxy_segment(
+    State(state): State<DanmakuHttpState>,
+    AxumPath((session_id, path)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    proxy_stream(&state, &session_id, &path).await
+}
+
+async fn proxy_stream(
+    state: &DanmakuHttpState,
+    session_id: &str,
+    path: &str,
+) -> impl IntoResponse {
+    fn cors_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("access-control-allow-origin", AxumHeaderValue::from_static("*"));
+        h
+    }
+
+    fn build_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("reqwest::Client::builder().build()")
+    }
+
+    fn base_url_of(url: &str) -> String {
+        let without_qs = url.split('?').next().unwrap_or(url);
+        if let Some(last_slash) = without_qs.rfind('/') {
+            without_qs[..=last_slash].to_string()
+        } else {
+            format!("{}/", without_qs)
+        }
+    }
+
+    let session = match state.stream_sessions.lock() {
+        Ok(sessions) => {
+            eprintln!("[stream-hub:proxy] lookup session {} total={}", session_id, sessions.len());
+            match sessions.get(session_id).cloned() {
+                Some(s) => s,
+                None => return (StatusCode::NOT_FOUND, cors_headers(), Body::from("session not found")),
+            }
+        }
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, cors_headers(), Body::from("lock error")),
     };
 
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    let mut request = client.get(&session.url);
+    let target_url = if path.is_empty() {
+        session.url.clone()
+    } else if path.contains(".m3u8") {
+        session.url.clone()
+    } else {
+        let base = base_url_of(&session.url);
+        let seg = path.trim_start_matches('/');
+        format!("{}{}", base, seg)
+    };
+
+    let client = build_client();
+    let mut request = client.get(&target_url);
     for (name, value) in session.headers {
         request = request.header(name, value);
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("[stream-hub:proxy] upstream request failed: {:?}", err);
+            return (StatusCode::BAD_GATEWAY, cors_headers(), Body::from(err.to_string()))
+        }
+    };
     let status = response.status();
     if !status.is_success() {
-        return Err((
+        eprintln!("[stream-hub:proxy] upstream returned status {} for {}", status, target_url);
+        return (
             StatusCode::BAD_GATEWAY,
-            format!("上游直播流返回状态码：{status}"),
-        ));
+            cors_headers(),
+            Body::from(format!("上游直播流返回状态码：{status}")),
+        );
     }
 
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert("access-control-allow-origin", AxumHeaderValue::from_static("*"));
+    let mut headers = cors_headers();
     headers.insert("cache-control", AxumHeaderValue::from_static("no-store"));
     if let Some(content_type) = response.headers().get(CONTENT_TYPE) {
         if let Ok(value) = AxumHeaderValue::from_str(content_type.to_str().unwrap_or_default()) {
@@ -2886,8 +2943,10 @@ async fn handle_stream_proxy(
         }
     }
 
-    Ok((StatusCode::OK, headers, Body::from_stream(response.bytes_stream())))
+    (StatusCode::OK, headers, Body::from_stream(response.bytes_stream()))
 }
+
+
 
 async fn handle_danmaku_websocket(
     State(state): State<DanmakuHttpState>,
