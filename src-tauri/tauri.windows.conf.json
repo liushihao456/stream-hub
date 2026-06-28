@@ -11,8 +11,7 @@
       "resources/huya.js": "huya.js",
       "resources/huya_icon.ico": "huya_icon.ico",
       "../douyu_extract_playurl.js": "douyu_extract_playurl.js",
-      "../douyu_search_streamers.js": "douyu_search_streamers.js",
-      "target/libmpv-runtime/windows": ""
+      "../douyu_search_streamers.js": "douyu_search_streamers.js"
     }
   }
 }

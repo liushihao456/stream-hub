@@ -1,5 +1,6 @@
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::body::Body;
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderValue as AxumHeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -33,23 +34,11 @@ use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use url::Url;
 use uuid::Uuid;
 
-mod player;
 
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
 #[cfg(target_os = "macos")]
-use objc2::rc::Retained;
-#[cfg(target_os = "macos")]
-use objc2::runtime::AnyObject;
-#[cfg(target_os = "macos")]
-use objc2::{class, msg_send};
-#[cfg(target_os = "macos")]
-use objc2_app_kit::{
-    NSApplicationActivationOptions, NSEvent, NSEventMask, NSEventModifierFlags,
-    NSRunningApplication,
-};
-#[cfg(target_os = "macos")]
-use objc2_foundation::{NSArray, NSHTTPCookie, NSString};
+use objc2_foundation::{NSArray, NSHTTPCookie};
 #[cfg(target_os = "macos")]
 use objc2_web_kit::WKWebView;
 #[cfg(target_os = "macos")]
@@ -69,8 +58,6 @@ const PLATFORM_HUYA: &str = "huya";
 const PLATFORM_DOUYIN_LIVE: &str = "douyin_live";
 const HUYA_SEARCH_STATUS_LIMIT: usize = 6;
 const DOUYIN_SEARCH_VERIFY_LIMIT: usize = 5;
-const PLAYBACK_FULLSCREEN_CHANGED_EVENT: &str = "playback-fullscreen-changed";
-static PLAYBACK_SHORTCUTS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn default_streamer_platform() -> String {
     PLATFORM_DOUYU.to_string()
@@ -97,11 +84,7 @@ struct Streamer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct Settings {
-    player: String,
-    iina_path: String,
-    mpv_path: String,
     bilibili_cookie: String,
-    enable_iina_danmaku: bool,
     #[serde(default = "default_danmaku_font_size")]
     danmaku_font_size: u32,
 }
@@ -109,11 +92,7 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            player: default_player().to_string(),
-            iina_path: String::new(),
-            mpv_path: String::new(),
             bilibili_cookie: String::new(),
-            enable_iina_danmaku: true,
             danmaku_font_size: default_danmaku_font_size(),
         }
     }
@@ -163,6 +142,29 @@ struct ExtractResult {
     urls: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FrontendPlayInfo {
+    platform: String,
+    room_id: String,
+    streamer_name: String,
+    room_name: String,
+    avatar_url: String,
+    is_online: bool,
+    screenshot_url: String,
+    heat_text: String,
+    page_url: String,
+    title: String,
+    urls: Vec<String>,
+    proxy_urls: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamProxySession {
+    url: String,
+    headers: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone)]
 struct RoomInfo {
     room_id: String,
@@ -205,6 +207,7 @@ struct DanmakuEventPayload {
 struct DanmakuServerState {
     started: AtomicBool,
     port: u16,
+    stream_sessions: Arc<Mutex<HashMap<String, StreamProxySession>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -515,20 +518,6 @@ struct DouyinDanmakuBatch {
     log_id: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IinaPlusArgs {
-    raw_url: String,
-    mpv_script: String,
-    port: u16,
-    urls: Vec<String>,
-    r#type: i32,
-    qualitys: Vec<String>,
-    lines: Vec<String>,
-    current_quality: usize,
-    current_line: usize,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct DanmakuWsQuery {
     #[serde(default, rename = "roomId")]
@@ -539,10 +528,10 @@ struct DanmakuWsQuery {
 
 #[derive(Clone)]
 struct DanmakuHttpState {
-    dummy_media: Arc<Vec<u8>>,
     node_bin: String,
     bridge_script: PathBuf,
     douyin_helper_script: PathBuf,
+    stream_sessions: Arc<Mutex<HashMap<String, StreamProxySession>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -553,8 +542,6 @@ struct PlatformIcons {
     huya: String,
     douyin: String,
 }
-
-const EMPTY_M4A_BYTES: &[u8] = include_bytes!("../resources/empty.m4a");
 
 fn douyu_client() -> Result<Client, String> {
     Client::builder()
@@ -586,10 +573,6 @@ fn douyin_client() -> Result<Client, String> {
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|err| err.to_string())
-}
-
-fn default_player() -> &'static str {
-    "libmpv"
 }
 
 fn normalize_platform(platform: &str) -> &'static str {
@@ -1546,7 +1529,7 @@ fn huya_ws_secret(
         .get("t")
         .cloned()
         .unwrap_or_else(|| "100".to_string());
-    let mut template = huya_decode_base64_to_string(&urlencoding::decode(fm).ok()?.to_string())?;
+    let mut template = huya_decode_base64_to_string(urlencoding::decode(fm).ok()?.as_ref())?;
     let suffix = md5_hex(&format!("{seq_id}|{ctype}|{t}"));
     template = template.replace("$0", &converted_uid.to_string());
     template = template.replace("$1", stream_name);
@@ -2105,10 +2088,6 @@ fn settings_file(app: &AppHandle) -> Result<PathBuf, String> {
 fn load_settings_inner(app: &AppHandle) -> Result<Settings, String> {
     let path = settings_file(app)?;
     let mut settings: Settings = read_json_or_default(&path)?;
-    settings.player = default_player().to_string();
-    settings.iina_path.clear();
-    settings.mpv_path.clear();
-    settings.enable_iina_danmaku = false;
     settings.danmaku_font_size = normalize_danmaku_font_size(settings.danmaku_font_size);
     Ok(settings)
 }
@@ -2116,10 +2095,6 @@ fn load_settings_inner(app: &AppHandle) -> Result<Settings, String> {
 fn save_settings_inner(app: &AppHandle, settings: &Settings) -> Result<(), String> {
     let path = settings_file(app)?;
     let mut normalized = settings.clone();
-    normalized.player = default_player().to_string();
-    normalized.iina_path.clear();
-    normalized.mpv_path.clear();
-    normalized.enable_iina_danmaku = false;
     normalized.danmaku_font_size = normalize_danmaku_font_size(normalized.danmaku_font_size);
     write_json(&path, &normalized)
 }
@@ -2185,88 +2160,6 @@ fn extract_bilibili_cookie_from_window<R: tauri::Runtime>(
     Ok(None)
 }
 
-#[cfg(target_os = "macos")]
-fn configure_main_webview_transparency<R: tauri::Runtime>(
-    window: &WebviewWindow<R>,
-) -> Result<(), String> {
-    window
-        .with_webview(|webview| unsafe {
-            let view: &WKWebView = &*webview.inner().cast();
-            let ns_color_class = class!(NSColor);
-            let clear_color: *mut AnyObject = msg_send![ns_color_class, clearColor];
-            let ns_number_class = class!(NSNumber);
-            let false_value: *mut AnyObject = msg_send![ns_number_class, numberWithBool: false];
-            let draws_background_key = NSString::from_str("drawsBackground");
-            let enclosing_scroll_view: *mut AnyObject = msg_send![view, enclosingScrollView];
-
-            let _: () = msg_send![view, setOpaque: false];
-            let _: () = msg_send![view, setBackgroundColor: clear_color];
-            let _: () = msg_send![view, setUnderPageBackgroundColor: clear_color];
-            let _: () = msg_send![view, setValue: false_value, forKey: &*draws_background_key];
-
-            if !enclosing_scroll_view.is_null() {
-                let _: () = msg_send![enclosing_scroll_view, setDrawsBackground: false];
-                let _: () = msg_send![enclosing_scroll_view, setBackgroundColor: clear_color];
-                let clip_view: *mut AnyObject = msg_send![enclosing_scroll_view, contentView];
-                if !clip_view.is_null() {
-                    let _: () = msg_send![clip_view, setDrawsBackground: false];
-                    let _: () = msg_send![clip_view, setBackgroundColor: clear_color];
-                }
-            }
-        })
-        .map_err(|err| format!("配置主窗口 WebView 透明背景失败：{err}"))
-}
-
-#[cfg(target_os = "macos")]
-fn install_playback_key_monitor(app: &AppHandle) {
-    let app = app.clone();
-    let block = Box::leak(Box::new(RcBlock::new(
-        move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
-            let event = unsafe { event_ptr.as_ref() };
-            if !PLAYBACK_SHORTCUTS_ACTIVE.load(Ordering::Acquire)
-                || !is_playback_fullscreen_key_event(event)
-            {
-                return event_ptr.as_ptr();
-            }
-
-            if let Some(window) = app.get_webview_window("main") {
-                let next_fullscreen = !window.is_fullscreen().unwrap_or(false);
-                match window.set_fullscreen(next_fullscreen) {
-                    Ok(()) => {
-                        let _ = app.emit(PLAYBACK_FULLSCREEN_CHANGED_EVENT, next_fullscreen);
-                    }
-                    Err(err) => {
-                        let _ = app.emit("embedded-player-error", format!("切换全屏失败：{err}"));
-                    }
-                }
-            }
-
-            std::ptr::null_mut()
-        },
-    )));
-
-    unsafe {
-        if let Some(monitor) =
-            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &**block)
-        {
-            let _ = Retained::into_raw(monitor);
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn is_playback_fullscreen_key_event(event: &NSEvent) -> bool {
-    if event.isARepeat() || event.keyCode() != 3 {
-        return false;
-    }
-
-    let flags = event.modifierFlags();
-    let blocked_modifiers = NSEventModifierFlags::Command
-        | NSEventModifierFlags::Control
-        | NSEventModifierFlags::Option;
-    !flags.intersects(blocked_modifiers)
-}
-
 fn save_bilibili_cookie_and_notify(app: &AppHandle, cookie: String) -> Result<Settings, String> {
     let mut settings = load_settings_inner(app)?;
     settings.bilibili_cookie = cookie;
@@ -2327,40 +2220,71 @@ fn spawn_bilibili_login_watcher(app: AppHandle) {
     });
 }
 
-fn write_playlist(title: &str, urls: &[String]) -> Result<PathBuf, String> {
-    let safe_title = if title.trim().is_empty() {
-        "Stream Hub Live".to_string()
-    } else {
-        title.trim().to_string()
-    };
+fn register_stream_proxy_sessions(
+    app: &AppHandle,
+    settings: &Settings,
+    data: &ExtractResult,
+    port: u16,
+) -> Result<Vec<String>, String> {
+    let state = app.state::<Arc<DanmakuServerState>>();
+    let headers = stream_proxy_headers_for_platform(&data.platform, settings)?;
+    let mut sessions = state
+        .stream_sessions
+        .lock()
+        .map_err(|_| "stream proxy 状态锁已损坏".to_string())?;
 
-    let mut content = vec!["#EXTM3U".to_string()];
-    for (index, url) in urls.iter().enumerate() {
-        let name = if index == 0 {
-            safe_title.clone()
-        } else {
-            format!("{safe_title} - Backup {index}")
-        };
-        content.push(format!("#EXTINF:-1,{name}"));
-        content.push(url.clone());
+    let mut proxy_urls = Vec::with_capacity(data.urls.len());
+    for url in &data.urls {
+        let session_id = Uuid::new_v4().to_string();
+        sessions.insert(
+            session_id.clone(),
+            StreamProxySession {
+                url: url.clone(),
+                headers: headers.clone(),
+            },
+        );
+        proxy_urls.push(format!("http://127.0.0.1:{port}/stream-proxy/{session_id}"));
     }
 
-    let path = env::temp_dir().join(format!("stream-hub-{}.m3u", Uuid::new_v4()));
-    fs::write(&path, content.join("\n") + "\n").map_err(|err| err.to_string())?;
-    Ok(path)
+    Ok(proxy_urls)
 }
 
-fn normalize_player(settings: &Settings) -> String {
-    let _ = settings;
-    default_player().to_string()
+fn stream_proxy_headers_for_platform(
+    platform: &str,
+    settings: &Settings,
+) -> Result<Vec<(String, String)>, String> {
+    let mut headers = Vec::new();
+    match platform {
+        PLATFORM_BILIBILI_LIVE => {
+            headers.push(("user-agent".to_string(), BILIBILI_USER_AGENT.to_string()));
+            headers.push(("referer".to_string(), "https://live.bilibili.com/".to_string()));
+            if let Some(cookie) = build_bilibili_cookie_string(&settings.bilibili_cookie)? {
+                headers.push(("cookie".to_string(), cookie));
+            }
+        }
+        PLATFORM_HUYA => {
+            headers.push(("user-agent".to_string(), HUYA_USER_AGENT.to_string()));
+            headers.push(("referer".to_string(), "https://www.huya.com/".to_string()));
+        }
+        PLATFORM_DOUYIN_LIVE => {
+            headers.push(("user-agent".to_string(), DOUYIN_USER_AGENT.to_string()));
+            headers.push(("referer".to_string(), "https://live.douyin.com/".to_string()));
+        }
+        _ => {
+            headers.push(("user-agent".to_string(), DOUYU_USER_AGENT.to_string()));
+            headers.push(("referer".to_string(), "https://www.douyu.com/".to_string()));
+        }
+    }
+    headers.push(("accept".to_string(), "*/*".to_string()));
+    Ok(headers)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        default_player, huya_heat_text, is_huya_room_online, normalize_danmaku_font_size,
-        normalize_player, select_bilibili_urls, BilibiliPlayCodec, BilibiliPlayFormat,
-        BilibiliPlayStream, BilibiliPlayurl, BilibiliUrlInfo, HuyaProfileRoomResponse, Settings,
+        huya_heat_text, is_huya_room_online, normalize_danmaku_font_size, select_bilibili_urls,
+        BilibiliPlayCodec, BilibiliPlayFormat, BilibiliPlayStream, BilibiliPlayurl,
+        BilibiliUrlInfo, HuyaProfileRoomResponse,
     };
 
     fn bilibili_codec(
@@ -2385,26 +2309,6 @@ mod tests {
                 }],
             }],
         }
-    }
-
-    #[test]
-    fn normalize_player_accepts_libmpv() {
-        let settings = Settings {
-            player: "libmpv".to_string(),
-            ..Settings::default()
-        };
-
-        assert_eq!(normalize_player(&settings), "libmpv");
-    }
-
-    #[test]
-    fn normalize_player_forces_libmpv_for_legacy_values() {
-        let settings = Settings {
-            player: "iina".to_string(),
-            ..Settings::default()
-        };
-
-        assert_eq!(normalize_player(&settings), default_player());
     }
 
     #[test]
@@ -2494,249 +2398,6 @@ mod tests {
             urls.first().map(String::as_str),
             Some("https://example.bilivideo.com/live/test.flv?token=test")
         );
-    }
-}
-
-fn detect_mpv(settings: &Settings) -> Result<String, String> {
-    if !settings.mpv_path.trim().is_empty() {
-        return Ok(settings.mpv_path.trim().to_string());
-    }
-
-    #[cfg(target_os = "windows")]
-    let candidates = vec!["mpv.exe".to_string(), "mpv".to_string()];
-
-    #[cfg(target_os = "macos")]
-    let candidates = vec![
-        "mpv".to_string(),
-        "/opt/homebrew/bin/mpv".to_string(),
-        "/usr/local/bin/mpv".to_string(),
-    ];
-
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let candidates = vec!["mpv".to_string()];
-
-    for program in candidates {
-        let mut cmd = Command::new(&program);
-        cmd.arg("--version");
-        if let Ok(status) = cmd.status() {
-            if status.success() {
-                return Ok(program);
-            }
-        }
-    }
-
-    Err("未找到可用的 mpv，请在设置里手动填写 mpv 路径。".into())
-}
-
-fn normalize_iina_cli_candidate(path: &str) -> String {
-    let trimmed = path.trim();
-    if trimmed.ends_with("/Contents/MacOS/iina-cli") {
-        trimmed.to_string()
-    } else if trimmed.ends_with(".app") {
-        format!("{trimmed}/Contents/MacOS/iina-cli")
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn escape_mpv_script_value(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn build_mpv_script_opts(data: &ExtractResult, media_title: &str) -> String {
-    let mut options = vec![
-        ("force-media-title", media_title.to_string()),
-        ("ytdl", "no".to_string()),
-        ("stream-lavf-o", "reconnect_streamed=yes".to_string()),
-    ];
-
-    if data.platform == PLATFORM_BILIBILI_LIVE {
-        options.push(("referrer", "https://live.bilibili.com/".to_string()));
-    } else if data.platform == PLATFORM_HUYA {
-        options.push(("referrer", "https://www.huya.com/".to_string()));
-        options.push(("user-agent", HUYA_USER_AGENT.to_string()));
-    } else if data.platform == PLATFORM_DOUYIN_LIVE {
-        options.push(("referrer", "https://live.douyin.com/".to_string()));
-        options.push(("user-agent", DOUYIN_USER_AGENT.to_string()));
-    }
-
-    options
-        .iter()
-        .map(|(key, value)| format!(r#"{key}="{}""#, escape_mpv_script_value(value)))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn encode_hex(data: &[u8]) -> String {
-    data.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn build_iina_plus_args(
-    data: &ExtractResult,
-    media_title: &str,
-    port: u16,
-) -> Result<String, String> {
-    let payload = IinaPlusArgs {
-        raw_url: data.page_url.clone(),
-        mpv_script: build_mpv_script_opts(data, media_title),
-        port,
-        urls: data.urls.clone(),
-        r#type: 0,
-        qualitys: vec!["原画".to_string()],
-        lines: data
-            .urls
-            .iter()
-            .enumerate()
-            .map(|(index, _)| format!("线路 {}", index + 1))
-            .collect(),
-        current_quality: 0,
-        current_line: 0,
-    };
-    let json = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
-    Ok(encode_hex(&json))
-}
-
-fn build_iina_plugin_url(args_hex: &str, port: u16) -> String {
-    let script_opt_pair = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("mpv_script-opts", &format!("iinaPlusArgs={args_hex}"))
-        .finish();
-    let checker = script_opt_pair
-        .chars()
-        .rev()
-        .take(25)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    let video_url = format!("http://127.0.0.1:{port}/video.mp4?{checker}");
-
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("new_window", "1");
-    serializer.append_pair("url", &video_url);
-    serializer.append_pair("mpv_script-opts", &format!("iinaPlusArgs={args_hex}"));
-    format!("iina://open?{}", serializer.finish())
-}
-
-fn detect_iina_cli(settings: &Settings) -> Result<String, String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = settings;
-        return Err("IINA 仅支持在 macOS 上使用。".to_string());
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if !settings.iina_path.trim().is_empty() {
-            let normalized = normalize_iina_cli_candidate(&settings.iina_path);
-            if Path::new(&normalized).exists() {
-                return Ok(normalized);
-            }
-            return Err("未找到你填写的 IINA 路径。".to_string());
-        }
-
-        let candidates = [
-            "/Applications/IINA.app/Contents/MacOS/iina-cli",
-            "/Applications/IINA Nightly.app/Contents/MacOS/iina-cli",
-            "/Applications/IINA.app",
-            "/Applications/IINA Nightly.app",
-        ];
-
-        for candidate in candidates {
-            let normalized = normalize_iina_cli_candidate(candidate);
-            if Path::new(&normalized).exists() {
-                return Ok(normalized);
-            }
-        }
-
-        Err("未找到可用的 IINA，请在设置里手动填写 IINA.app 或 iina-cli 路径。".to_string())
-    }
-}
-
-fn iina_process_name_from_cli(iina_cli: &str) -> String {
-    if iina_cli.contains("Nightly") {
-        "IINA Nightly".to_string()
-    } else {
-        "IINA".to_string()
-    }
-}
-
-fn bring_iina_to_front(process_name: &str) {
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = process_name;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let bundle_id = if process_name.contains("Nightly") {
-            "com.colliderli.iina-nightly"
-        } else {
-            "com.colliderli.iina"
-        }
-        .to_string();
-
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(350));
-            let apps = NSRunningApplication::runningApplicationsWithBundleIdentifier(
-                NSString::from_str(&bundle_id).as_ref(),
-            );
-            if let Some(app) = apps.firstObject() {
-                let _ = app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
-            }
-        });
-    }
-}
-
-fn iina_plugin_root() -> Result<PathBuf, String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return Err("IINA 插件仅支持在 macOS 上安装。".to_string());
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let home = env::var("HOME").map_err(|err| err.to_string())?;
-        let path =
-            PathBuf::from(home).join("Library/Application Support/com.colliderli.iina/plugins");
-        fs::create_dir_all(&path).map_err(|err| err.to_string())?;
-        Ok(path)
-    }
-}
-
-fn enable_iina_plugin_system() -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return Ok(());
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let status = Command::new("defaults")
-            .arg("write")
-            .arg("com.colliderli.iina")
-            .arg("iinaEnablePluginSystem")
-            .arg("-bool")
-            .arg("true")
-            .status()
-            .map_err(|err| format!("启用 IINA 插件系统失败：{err}"))?;
-
-        if status.success() {
-            Ok(())
-        } else {
-            Err("启用 IINA 插件系统失败。".to_string())
-        }
-    }
-}
-
-fn xjbeta_iina_plugin_dir() -> Result<PathBuf, String> {
-    let plugin_dir = iina_plugin_root()?.join("com.xjbeta.danmaku.iinaplugin");
-    if plugin_dir.exists() {
-        Ok(plugin_dir)
-    } else {
-        Err(
-            "未检测到 IINA 弹幕插件 com.xjbeta.danmaku，请先安装 iina-plus 的弹幕插件。"
-                .to_string(),
-        )
     }
 }
 
@@ -3075,220 +2736,6 @@ fn encode_douyin_push_frame(payload_type: &str, log_id: u64, payload: &[u8]) -> 
     output
 }
 
-fn enable_xjbeta_iina_plugin() -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let _ = xjbeta_iina_plugin_dir()?;
-        let plugin_key = "PluginEnabled.com.xjbeta.danmaku";
-        let status = Command::new("defaults")
-            .arg("write")
-            .arg("com.colliderli.iina")
-            .arg(plugin_key)
-            .arg("-bool")
-            .arg("true")
-            .status()
-            .map_err(|err| format!("启用 IINA 弹幕插件失败：{err}"))?;
-
-        if !status.success() {
-            return Err("启用 IINA 弹幕插件失败。".to_string());
-        }
-
-        let preferences_dir = iina_plugin_root()?.join(".preferences");
-        fs::create_dir_all(&preferences_dir).map_err(|err| err.to_string())?;
-        let pref_plist = preferences_dir.join("com.xjbeta.danmaku.plist");
-        let parse_status = Command::new("defaults")
-            .arg("write")
-            .arg(pref_plist.as_os_str())
-            .arg("enableIINAPLUSOptsParse")
-            .arg("1")
-            .status()
-            .map_err(|err| format!("启用 IINA 弹幕参数解析失败：{err}"))?;
-
-        if parse_status.success() {
-            patch_xjbeta_plugin_visibility_behavior()?;
-            Ok(())
-        } else {
-            Err("启用 IINA 弹幕参数解析失败。".to_string())
-        }
-    }
-}
-
-fn patch_xjbeta_plugin_visibility_behavior() -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let plugin_file = xjbeta_iina_plugin_dir()?.join("DanmakuWeb/main.js");
-        let content = fs::read_to_string(&plugin_file).map_err(|err| err.to_string())?;
-
-        let old_block = r#"    document.addEventListener('visibilitychange', function () {
-        if (document.visibilityState == 'visible') {
-            console.log('visible');
-            cm.start();
-            cm.clear();
-        } else {
-            console.log('hidden');
-            cm.stop();
-            cm.clear();
-        };
-    });
-"#;
-
-        let new_block = r#"    document.addEventListener('visibilitychange', function () {
-        if (document.visibilityState == 'visible') {
-            console.log('visible');
-            cm.start();
-        } else {
-            console.log('hidden');
-            cm.stop();
-        };
-    });
-"#;
-
-        if content.contains(new_block) {
-            return Ok(());
-        }
-
-        if !content.contains(old_block) {
-            return Err("未找到可修补的 IINA 弹幕可见性逻辑。".to_string());
-        }
-
-        let patched = content.replacen(old_block, new_block, 1);
-        fs::write(&plugin_file, patched).map_err(|err| err.to_string())?;
-        Ok(())
-    }
-}
-
-fn open_iina_playlist_cli(
-    iina_cli: &str,
-    playlist_path: &Path,
-    media_title: &str,
-    data: &ExtractResult,
-) -> Result<(), String> {
-    let mut command = Command::new(iina_cli);
-    command.arg("--no-stdin");
-    command.arg("--mpv-pause=no");
-    command.arg("--mpv-force-window=immediate");
-    command.arg("--mpv-ytdl=no");
-    command.arg("--mpv-stream-lavf-o=reconnect_streamed=yes");
-    command.arg(format!("--mpv-force-media-title={media_title}"));
-    if data.platform == PLATFORM_BILIBILI_LIVE {
-        command.arg("--mpv-referrer=https://live.bilibili.com/");
-    } else if data.platform == PLATFORM_HUYA {
-        command.arg("--mpv-referrer=https://www.huya.com/");
-        command.arg(format!("--mpv-user-agent={HUYA_USER_AGENT}"));
-    } else if data.platform == PLATFORM_DOUYIN_LIVE {
-        command.arg("--mpv-referrer=https://live.douyin.com/");
-        command.arg(format!("--mpv-user-agent={DOUYIN_USER_AGENT}"));
-    }
-    command.arg(playlist_path);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
-    command.stderr(Stdio::null());
-    command.spawn().map_err(|err| err.to_string())?;
-    Ok(())
-}
-
-fn open_iina_plugin_url_scheme(args_hex: &str, danmaku_port: u16) -> Result<(), String> {
-    let url = build_iina_plugin_url(args_hex, danmaku_port);
-    let status = Command::new("open")
-        .arg(&url)
-        .status()
-        .map_err(|err| err.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("通过 IINA URL Scheme 启动失败。".to_string())
-    }
-}
-
-fn open_iina_playlist(
-    app: &AppHandle,
-    settings: &Settings,
-    playlist_path: &Path,
-    media_title: &str,
-    data: &ExtractResult,
-) -> Result<(), String> {
-    let iina_cli = detect_iina_cli(settings)?;
-    let iina_process_name = iina_process_name_from_cli(&iina_cli);
-    let enable_danmaku = settings.enable_iina_danmaku
-        && matches!(
-            data.platform.as_str(),
-            PLATFORM_DOUYU | PLATFORM_BILIBILI_LIVE | PLATFORM_HUYA | PLATFORM_DOUYIN_LIVE
-        );
-    if enable_danmaku {
-        enable_iina_plugin_system()?;
-        enable_xjbeta_iina_plugin()?;
-    }
-
-    if enable_danmaku {
-        let danmaku_port = ensure_danmaku_server_running(app)?;
-        let args_hex = build_iina_plus_args(data, media_title, danmaku_port)?;
-        if open_iina_plugin_url_scheme(&args_hex, danmaku_port).is_err() {
-            let mut command = Command::new(&iina_cli);
-            command.arg("--no-stdin");
-            command.arg("--mpv-pause=no");
-            command.arg("--mpv-force-window=immediate");
-            command.arg(format!("--mpv-script-opts=iinaPlusArgs={args_hex}"));
-            command.arg(format!(
-                "http://127.0.0.1:{danmaku_port}/video.mp4?{}",
-                args_hex
-                    .chars()
-                    .rev()
-                    .take(25)
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>()
-            ));
-            command.stdin(Stdio::null());
-            command.stdout(Stdio::null());
-            command.stderr(Stdio::null());
-            command.spawn().map_err(|err| err.to_string())?;
-        }
-    } else {
-        open_iina_playlist_cli(&iina_cli, playlist_path, media_title, data)?;
-    }
-    bring_iina_to_front(&iina_process_name);
-    Ok(())
-}
-
-fn open_mpv_playlist(
-    playlist_path: &Path,
-    media_title: &str,
-    data: &ExtractResult,
-    settings: &Settings,
-) -> Result<(), String> {
-    let mpv_bin = detect_mpv(settings)?;
-    let mut command = Command::new(mpv_bin);
-    command.arg("--ytdl=no");
-    command.arg("--stream-lavf-o=reconnect_streamed=yes");
-    command.arg(format!("--force-media-title={media_title}"));
-    if data.platform == PLATFORM_BILIBILI_LIVE {
-        command.arg("--referrer=https://live.bilibili.com/");
-    } else if data.platform == PLATFORM_HUYA {
-        command.arg("--referrer=https://www.huya.com/");
-        command.arg(format!("--user-agent={HUYA_USER_AGENT}"));
-    } else if data.platform == PLATFORM_DOUYIN_LIVE {
-        command.arg("--referrer=https://live.douyin.com/");
-        command.arg(format!("--user-agent={DOUYIN_USER_AGENT}"));
-    }
-    command.arg(playlist_path);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
-    command.stderr(Stdio::null());
-    command.spawn().map_err(|err| err.to_string())?;
-    Ok(())
-}
-
 fn ensure_danmaku_server_running(app: &AppHandle) -> Result<u16, String> {
     let state = app.state::<Arc<DanmakuServerState>>();
     if state.started.swap(true, Ordering::SeqCst) {
@@ -3297,10 +2744,10 @@ fn ensure_danmaku_server_running(app: &AppHandle) -> Result<u16, String> {
 
     let port = state.port;
     let http_state = DanmakuHttpState {
-        dummy_media: Arc::new(EMPTY_M4A_BYTES.to_vec()),
         node_bin: detect_node_binary()?,
         bridge_script: locate_danmaku_bridge_script(app)?,
         douyin_helper_script: locate_douyin_helper_script(app)?,
+        stream_sessions: Arc::clone(&state.stream_sessions),
     };
     let state_ref = Arc::clone(&state.inner().clone());
     tauri::async_runtime::spawn(async move {
@@ -3316,17 +2763,60 @@ fn ensure_danmaku_server_running(app: &AppHandle) -> Result<u16, String> {
 
 async fn run_danmaku_server(listener: TcpListener, state: DanmakuHttpState) {
     let app = Router::new()
-        .route("/video.mp4", get(handle_dummy_video))
         .route("/danmaku-websocket", get(handle_danmaku_websocket))
+        .route("/stream-proxy/{session_id}", get(handle_stream_proxy))
         .with_state(state);
     let _ = axum::serve(listener, app).await;
 }
 
-async fn handle_dummy_video(State(state): State<DanmakuHttpState>) -> impl IntoResponse {
+async fn handle_stream_proxy(
+    State(state): State<DanmakuHttpState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session = {
+        let sessions = state.stream_sessions.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stream proxy 状态锁已损坏".to_string(),
+            )
+        })?;
+        sessions.get(&session_id).cloned().ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "stream proxy session 不存在或已过期".to_string(),
+            )
+        })?
+    };
+
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let mut request = client.get(&session.url);
+    for (name, value) in session.headers {
+        request = request.header(name, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("上游直播流返回状态码：{status}"),
+        ));
+    }
+
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert("content-type", AxumHeaderValue::from_static("audio/mp4"));
+    headers.insert("access-control-allow-origin", AxumHeaderValue::from_static("*"));
     headers.insert("cache-control", AxumHeaderValue::from_static("no-store"));
-    (StatusCode::OK, headers, (*state.dummy_media).clone())
+    if let Some(content_type) = response.headers().get(CONTENT_TYPE) {
+        if let Ok(value) = AxumHeaderValue::from_str(content_type.to_str().unwrap_or_default()) {
+            headers.insert("content-type", value);
+        }
+    }
+
+    Ok((StatusCode::OK, headers, Body::from_stream(response.bytes_stream())))
 }
 
 async fn handle_danmaku_websocket(
@@ -3340,30 +2830,7 @@ async fn handle_danmaku_websocket(
 }
 
 fn parse_danmaku_target_from_client_message(message: &str) -> Option<(String, String)> {
-    let payload = if let Some(raw) = message.strip_prefix("iinaWebDM://") {
-        if let Some((prefix, url)) = raw.split_once('&') {
-            if prefix.starts_with("v=") {
-                url
-            } else {
-                raw
-            }
-        } else {
-            raw
-        }
-    } else if let Some(raw) = message.strip_prefix("iinaDM://") {
-        if let Some((prefix, url)) = raw.split_once('&') {
-            if prefix.starts_with("v=") {
-                url
-            } else {
-                raw
-            }
-        } else {
-            raw
-        }
-    } else {
-        message
-    };
-
+    let payload = message;
     let platform = infer_platform_from_target(payload).to_string();
     let room_id = match platform.as_str() {
         PLATFORM_BILIBILI_LIVE => extract_bilibili_room_id(payload),
@@ -4314,27 +3781,47 @@ async fn sync_streamers_status(
 }
 
 #[tauri::command]
-async fn play_streamer(
+async fn resolve_stream_playback(
     app: AppHandle,
     streamer: Streamer,
     settings: Settings,
-) -> Result<(), String> {
-    let streamer_for_extract = streamer.clone();
-    let settings_for_extract = settings.clone();
-    let app_for_extract = app.clone();
-    let settings_for_extract_task = settings.clone();
-    let streamer_for_extract_task = streamer.clone();
-    let extracted = tauri::async_runtime::spawn_blocking(move || {
-        let platform = if streamer_for_extract_task.platform.trim().is_empty() {
-            infer_platform_from_target(&streamer_for_extract_task.target).to_string()
+) -> Result<FrontendPlayInfo, String> {
+    let data = extract_stream_playback_data(app.clone(), streamer, settings.clone()).await?;
+    let port = ensure_danmaku_server_running(&app)?;
+    let proxy_urls = register_stream_proxy_sessions(&app, &settings, &data, port)?;
+
+    Ok(FrontendPlayInfo {
+        platform: data.platform,
+        room_id: data.room_id,
+        streamer_name: data.streamer_name,
+        room_name: data.room_name,
+        avatar_url: data.avatar_url,
+        is_online: data.is_online,
+        screenshot_url: data.screenshot_url,
+        heat_text: data.heat_text,
+        page_url: data.page_url,
+        title: data.title,
+        urls: data.urls,
+        proxy_urls,
+    })
+}
+
+async fn extract_stream_playback_data(
+    app: AppHandle,
+    streamer: Streamer,
+    settings: Settings,
+) -> Result<ExtractResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let platform = if streamer.platform.trim().is_empty() {
+            infer_platform_from_target(&streamer.target).to_string()
         } else {
-            normalize_platform(&streamer_for_extract_task.platform).to_string()
+            normalize_platform(&streamer.platform).to_string()
         };
         let data = extract_play_info_for_platform_with_app(
-            Some(&app_for_extract),
+            Some(&app),
             &platform,
-            &streamer_for_extract_task.target,
-            &settings_for_extract_task.bilibili_cookie,
+            &streamer.target,
+            &settings.bilibili_cookie,
         )?;
         if !data.is_online {
             return Err("主播当前未开播".into());
@@ -4343,40 +3830,10 @@ async fn play_streamer(
             return Err("未获取到可播放的直播地址".into());
         }
 
-        let playlist_path = write_playlist(&data.title, &data.urls)?;
-        let media_title = if data.title.trim().is_empty() {
-            "Stream Hub Live".to_string()
-        } else {
-            data.title.clone()
-        };
-
-        Ok::<_, String>((data, playlist_path, media_title))
+        Ok::<_, String>(data)
     })
     .await
-    .map_err(|err| err.to_string())??;
-
-    let (data, playlist_path, media_title) = extracted;
-
-    match normalize_player(&settings).as_str() {
-        "libmpv" => app.state::<player::EmbeddedPlayerManager>().play(
-            &app,
-            streamer_for_extract,
-            settings_for_extract,
-            data,
-            media_title,
-        ),
-        "iina" => open_iina_playlist(&app, &settings, &playlist_path, &media_title, &data),
-        _ => open_mpv_playlist(&playlist_path, &media_title, &data, &settings),
-    }
-}
-
-#[tauri::command]
-fn embedded_player_set_bounds(
-    app: AppHandle,
-    bounds: player::EmbeddedPlayerBounds,
-) -> Result<player::EmbeddedPlayerSnapshot, String> {
-    app.state::<player::EmbeddedPlayerManager>()
-        .set_bounds(&app, bounds)
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -4384,41 +3841,13 @@ fn ensure_danmaku_server(app: AppHandle) -> Result<u16, String> {
     ensure_danmaku_server_running(&app)
 }
 
-#[tauri::command]
-fn embedded_player_get_state(app: AppHandle) -> Result<player::EmbeddedPlayerSnapshot, String> {
-    Ok(app.state::<player::EmbeddedPlayerManager>().get_state())
-}
-
-#[tauri::command]
-fn embedded_player_command(
-    app: AppHandle,
-    command: player::EmbeddedPlayerCommandPayload,
-) -> Result<player::EmbeddedPlayerSnapshot, String> {
-    app.state::<player::EmbeddedPlayerManager>()
-        .command(&app, command)
-}
-
-#[tauri::command]
-fn set_playback_shortcuts_active(active: bool) {
-    PLAYBACK_SHORTCUTS_ACTIVE.store(active, Ordering::Release);
-}
-
 pub fn run() {
     tauri::Builder::default()
-        .setup(|app| {
-            #[cfg(target_os = "macos")]
-            if let Some(window) = app.get_webview_window("main") {
-                configure_main_webview_transparency(&window)?;
-                install_playback_key_monitor(app.handle());
-            }
-
-            Ok(())
-        })
         .manage(Arc::new(DanmakuServerState {
             started: AtomicBool::new(false),
             port: 19080,
+            stream_sessions: Arc::new(Mutex::new(HashMap::new())),
         }))
-        .manage(player::EmbeddedPlayerManager::new())
         .invoke_handler(tauri::generate_handler![
             load_streamers,
             save_streamers,
@@ -4432,12 +3861,8 @@ pub fn run() {
             search_streamers,
             search_streamers_by_platform,
             sync_streamers_status,
-            play_streamer,
-            ensure_danmaku_server,
-            embedded_player_set_bounds,
-            embedded_player_get_state,
-            embedded_player_command,
-            set_playback_shortcuts_active
+            resolve_stream_playback,
+            ensure_danmaku_server
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

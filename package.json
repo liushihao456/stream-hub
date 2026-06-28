@@ -1,13 +1,12 @@
 {
   "name": "stream-hub",
   "version": "0.1.6",
-  "description": "Desktop app for watching favorite streamers with embedded libmpv",
+  "description": "Desktop app for watching favorite streamers with a web player",
   "main": "douyu_extract_playurl.js",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "vite build",
     "preview": "vite preview",
-    "pretauri:build": "node scripts/prepare-libmpv-runtime.mjs",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "posttauri:build": "node scripts/sign-macos-app.mjs"
@@ -18,6 +17,8 @@
   "type": "commonjs",
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
+    "hls.js": "^1.6.16",
+    "mpegts.js": "^1.8.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"
   },

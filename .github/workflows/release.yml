@@ -55,53 +55,6 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Install macOS libmpv
-        if: runner.os == 'macOS'
-        run: brew install mpv
-
-      - name: Install Windows libmpv
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $mpvDir = Join-Path $env:RUNNER_TEMP "libmpv"
-          New-Item -ItemType Directory -Force -Path $mpvDir | Out-Null
-
-          $release = Invoke-RestMethod "https://api.github.com/repos/zhongfly/mpv-winbuild/releases/latest"
-          $asset = $release.assets |
-            Where-Object { $_.name -match '^mpv-dev-lgpl-x86_64-\d+.*\.7z$' } |
-            Select-Object -First 1
-
-          if (-not $asset) {
-            throw "Could not find a zhongfly libmpv development archive."
-          }
-
-          $archive = Join-Path $env:RUNNER_TEMP $asset.name
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
-          7z x $archive "-o$mpvDir" -y
-
-          $dll = Join-Path $mpvDir "libmpv-2.dll"
-          if (-not (Test-Path $dll)) {
-            throw "libmpv-2.dll was not found in the downloaded archive."
-          }
-
-          $exports = & dumpbin /exports $dll |
-            Select-String '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(mpv_.+)$' |
-            ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() }
-
-          if (-not $exports) {
-            throw "Could not read libmpv exports from libmpv-2.dll."
-          }
-
-          $def = Join-Path $mpvDir "mpv.def"
-          $lib = Join-Path $mpvDir "mpv.lib"
-          @("LIBRARY libmpv-2.dll", "EXPORTS") + $exports | Set-Content -Path $def -Encoding ASCII
-          & lib /def:$def /name:libmpv-2.dll /out:$lib /machine:x64
-
-          "LIB=$mpvDir;$env:LIB" >> $env:GITHUB_ENV
-          "STREAM_HUB_MPV_RUNTIME_DIR=$mpvDir" >> $env:GITHUB_ENV
-          $mpvDir >> $env:GITHUB_PATH
-
       - name: Configure npm registry
         run: |
           npm config set registry https://registry.npmjs.org/
