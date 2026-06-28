@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import Hls from "hls.js";
 import mpegts from "mpegts.js";
 
@@ -12,6 +13,8 @@ const tabs = [
 
 const searchPlatforms = ["douyu", "bilibili_live", "huya", "douyin_live"];
 const PLAYBACK_BACK_HIDE_DELAY_MS = 2000;
+const PLAYBACK_LIVE_CACHE_SECONDS = 300;
+const PLAYBACK_STATE_INTERVAL_MS = 500;
 const DEFAULT_DANMAKU_FONT_SIZE = 18;
 const DANMAKU_TOP_PADDING = 24;
 const DANMAKU_BOTTOM_PADDING = 28;
@@ -607,7 +610,7 @@ function describePlaybackUrl(url) {
 	}
 }
 
-function FrontendVideoPlayer({ playInfo, onReady, onError }) {
+function FrontendVideoPlayer({ playInfo, onReady, onError, onPlaybackState, onSeekReady }) {
 	const videoRef = useRef(null);
 	const readyFiredRef = useRef(false);
 
@@ -628,7 +631,53 @@ function FrontendVideoPlayer({ playInfo, onReady, onError }) {
 		let disposed = false;
 		let player = null;
 		let hls = null;
+		let playbackStateTimer = 0;
 		readyFiredRef.current = false;
+
+		function readBufferedState() {
+			const current = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+			let start = current;
+			let end = current;
+			for (let i = 0; i < video.buffered.length; i += 1) {
+				const rangeStart = video.buffered.start(i);
+				const rangeEnd = video.buffered.end(i);
+				if (current >= rangeStart && current <= rangeEnd + 0.5) {
+					start = rangeStart;
+					end = rangeEnd;
+					break;
+				}
+				if (rangeEnd > end) {
+					start = rangeStart;
+					end = rangeEnd;
+				}
+			}
+			start = Math.max(start, end - PLAYBACK_LIVE_CACHE_SECONDS);
+			onPlaybackState?.({
+				positionSeconds: Math.min(end, Math.max(start, current)),
+				startSeconds: start,
+				endSeconds: end,
+				seekable: end - start > 2,
+			});
+		}
+
+		function seekTo(seconds) {
+			if (!Number.isFinite(seconds)) {
+				return;
+			}
+			let start = 0;
+			let end = seconds;
+			if (video.buffered.length > 0) {
+				start = video.buffered.start(0);
+				end = video.buffered.end(video.buffered.length - 1);
+			}
+			const target = Math.min(end, Math.max(start, seconds));
+			video.currentTime = target;
+			readBufferedState();
+			handlePlayPromise(video.play());
+		}
+
+		onSeekReady?.(seekTo);
+		playbackStateTimer = window.setInterval(readBufferedState, PLAYBACK_STATE_INTERVAL_MS);
 
 		console.info("[stream-hub:player] init", {
 			platform: playInfo?.platform,
@@ -711,13 +760,21 @@ function FrontendVideoPlayer({ playInfo, onReady, onError }) {
 		for (const eventName of videoEvents) {
 			video.addEventListener(eventName, logVideoEvent);
 		}
+		for (const eventName of ["timeupdate", "progress", "durationchange", "loadedmetadata"]) {
+			video.addEventListener(eventName, readBufferedState);
+		}
 		video.addEventListener("playing", fireReady);
 		video.addEventListener("canplay", fireReady);
 
 		if (type === "hls") {
 			if (Hls.isSupported()) {
 				console.info("[stream-hub:player] using hls.js");
-				hls = new Hls({ lowLatencyMode: true });
+				hls = new Hls({
+					lowLatencyMode: true,
+					backBufferLength: PLAYBACK_LIVE_CACHE_SECONDS,
+					liveBackBufferLength: PLAYBACK_LIVE_CACHE_SECONDS,
+					maxBufferLength: PLAYBACK_LIVE_CACHE_SECONDS,
+				});
 				hls.on(Hls.Events.ERROR, (_event, data) => {
 					console.error("[stream-hub:player] hls error", data);
 					if (data?.fatal && !disposed) {
@@ -756,9 +813,17 @@ function FrontendVideoPlayer({ playInfo, onReady, onError }) {
 		return () => {
 			disposed = true;
 			console.info("[stream-hub:player] cleanup");
+			if (playbackStateTimer) {
+				window.clearInterval(playbackStateTimer);
+				playbackStateTimer = 0;
+			}
+			onSeekReady?.(null);
 			try {
 				for (const eventName of videoEvents) {
 					video.removeEventListener(eventName, logVideoEvent);
+				}
+				for (const eventName of ["timeupdate", "progress", "durationchange", "loadedmetadata"]) {
+					video.removeEventListener(eventName, readBufferedState);
 				}
 				video.removeEventListener("playing", fireReady);
 				video.removeEventListener("canplay", fireReady);
@@ -773,7 +838,7 @@ function FrontendVideoPlayer({ playInfo, onReady, onError }) {
 				// Ignore cleanup errors from media internals.
 			}
 		};
-	}, [playInfo, onReady, onError]);
+	}, [playInfo, onReady, onError, onPlaybackState, onSeekReady]);
 
 	return <video ref={videoRef} className="frontend-video" playsInline />;
 }
@@ -806,6 +871,13 @@ function App() {
 	const [playbackFullscreen, setPlaybackFullscreen] = useState(false);
 	const [currentPlaybackStreamer, setCurrentPlaybackStreamer] = useState(null);
 	const [frontendPlayback, setFrontendPlayback] = useState({ phase: "idle", playInfo: null, errorMessage: "" });
+	const [playbackTrack, setPlaybackTrack] = useState({
+		positionSeconds: 0,
+		startSeconds: 0,
+		endSeconds: 0,
+		seekable: false,
+		dragging: false,
+	});
 	const [danmakuItems, setDanmakuItems] = useState([]);
 	const playbackPageRef = useRef(null);
 	const playerSurfaceRef = useRef(null);
@@ -816,6 +888,15 @@ function App() {
 	const playbackControlsHoldCountRef = useRef(0);
 	const playbackExitInFlightRef = useRef(false);
 	const playbackAwaitingStartRef = useRef(false);
+	const playbackSeekRef = useRef(null);
+	const playbackTrackRef = useRef({
+		positionSeconds: 0,
+		startSeconds: 0,
+		endSeconds: 0,
+		seekable: false,
+		dragging: false,
+	});
+	const playbackTrackDraggingRef = useRef(false);
 	const playbackFullscreenRef = useRef(false);
 	const playbackFullscreenCommandInFlightRef = useRef(false);
 	const playbackFullscreenToggleQueuedRef = useRef(false);
@@ -861,6 +942,76 @@ function App() {
 		}
 	}
 
+	function updatePlaybackTrackState(nextOrUpdater) {
+		setPlaybackTrack((current) => {
+			const next = typeof nextOrUpdater === "function"
+				? nextOrUpdater(current)
+				: nextOrUpdater;
+			playbackTrackRef.current = next;
+			return next;
+		});
+	}
+
+	function seekPlaybackTrackFromEvent(event) {
+		const track = playbackTrackRef.current;
+		if (!track.seekable || track.endSeconds <= track.startSeconds) {
+			return;
+		}
+		const rect = event.currentTarget.getBoundingClientRect();
+		const ratio = rect.width > 0
+			? Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width))
+			: 1;
+		const target = track.startSeconds + ratio * (track.endSeconds - track.startSeconds);
+		playbackSeekRef.current?.(target);
+		updatePlaybackTrackState((current) => ({ ...current, positionSeconds: target }));
+	}
+
+	function handlePlaybackTrackPointerDown(event) {
+		if (!playbackTrackRef.current.seekable) {
+			return;
+		}
+		event.preventDefault();
+		playbackTrackDraggingRef.current = true;
+		event.currentTarget.setPointerCapture?.(event.pointerId);
+		holdPlaybackControls();
+		updatePlaybackTrackState((current) => ({ ...current, dragging: true }));
+		seekPlaybackTrackFromEvent(event);
+	}
+
+	function handlePlaybackTrackPointerMove(event) {
+		if (!playbackTrackDraggingRef.current) {
+			return;
+		}
+		event.preventDefault();
+		seekPlaybackTrackFromEvent(event);
+	}
+
+	function handlePlaybackTrackPointerEnd(event) {
+		if (!playbackTrackDraggingRef.current) {
+			return;
+		}
+		event.preventDefault();
+		playbackTrackDraggingRef.current = false;
+		event.currentTarget.releasePointerCapture?.(event.pointerId);
+		updatePlaybackTrackState((current) => ({ ...current, dragging: false }));
+		releasePlaybackControls();
+	}
+
+	function seekPlaybackBy(deltaSeconds) {
+		const track = playbackTrackRef.current;
+		if (!track.seekable || !playbackSeekRef.current) {
+			return false;
+		}
+		const target = Math.min(
+			track.endSeconds,
+			Math.max(track.startSeconds, track.positionSeconds + deltaSeconds),
+		);
+		playbackSeekRef.current(target);
+		updatePlaybackTrackState((current) => ({ ...current, positionSeconds: target }));
+		revealPlaybackControls();
+		return true;
+	}
+
 	function clearPlaybackFocusTimers() {
 		for (const timer of playbackFocusTimersRef.current) {
 			window.clearTimeout(timer);
@@ -892,19 +1043,35 @@ function App() {
 	async function setPlaybackFullscreenMode(value, { reportError = true } = {}) {
 		const nextValue = Boolean(value);
 		try {
+			const target = playbackPageRef.current || playerSurfaceRef.current || document.documentElement;
 			if (nextValue && !document.fullscreenElement) {
-				await document.documentElement.requestFullscreen?.();
-			} else if (!nextValue && document.fullscreenElement) {
-				await document.exitFullscreen?.();
+				if (target.requestFullscreen) {
+					await target.requestFullscreen();
+				} else {
+					await getCurrentWindow().setFullscreen(true);
+				}
+			} else if (!nextValue) {
+				if (document.fullscreenElement) {
+					await document.exitFullscreen?.();
+				} else {
+					await getCurrentWindow().setFullscreen(false);
+				}
 			}
 			playbackFullscreenRef.current = nextValue;
 			setPlaybackFullscreen(nextValue);
 			return true;
 		} catch (err) {
-			if (reportError) {
-				setError(String(err));
+			try {
+				await getCurrentWindow().setFullscreen(nextValue);
+				playbackFullscreenRef.current = nextValue;
+				setPlaybackFullscreen(nextValue);
+				return true;
+			} catch (fallbackErr) {
+				if (reportError) {
+					setError(String(fallbackErr || err));
+				}
+				return false;
 			}
-			return false;
 		}
 	}
 
@@ -1084,6 +1251,18 @@ function App() {
 		danmakuTimersRef.current.set(item.id, timer);
 	}
 
+	function resetPlaybackTrack() {
+		playbackSeekRef.current = null;
+		playbackTrackDraggingRef.current = false;
+		updatePlaybackTrackState({
+			positionSeconds: 0,
+			startSeconds: 0,
+			endSeconds: 0,
+			seekable: false,
+			dragging: false,
+		});
+	}
+
 	function restoreBrowseView() {
 		playbackAwaitingStartRef.current = false;
 		clearPlaybackBackHideTimer();
@@ -1092,6 +1271,7 @@ function App() {
 		playbackPointerPositionRef.current = { x: null, y: null };
 		playbackFullscreenToggleQueuedRef.current = false;
 		clearDanmakuState();
+		resetPlaybackTrack();
 		setCurrentPlaybackStreamer(null);
 		setFrontendPlayback({ phase: "idle", playInfo: null, errorMessage: "" });
 		setPlaybackBackVisible(false);
@@ -1167,6 +1347,7 @@ function App() {
 		playbackControlsHoldCountRef.current = 0;
 		playbackPointerPositionRef.current = { x: null, y: null };
 		playbackFullscreenToggleQueuedRef.current = false;
+		resetPlaybackTrack();
 		setPlaybackBackVisible(false);
 		setViewMode("playback");
 		window.scrollTo(0, 0);
@@ -1381,6 +1562,22 @@ function App() {
 	}, [viewMode]);
 
 	useEffect(() => {
+		function handleFullscreenChange() {
+			const active = Boolean(document.fullscreenElement);
+			playbackFullscreenRef.current = active;
+			setPlaybackFullscreen(active);
+			if (active) {
+				schedulePlaybackFocusRefresh();
+			}
+		}
+
+		document.addEventListener("fullscreenchange", handleFullscreenChange);
+		return () => {
+			document.removeEventListener("fullscreenchange", handleFullscreenChange);
+		};
+	}, []);
+
+	useEffect(() => {
 		if (viewMode !== "playback") {
 			return undefined;
 		}
@@ -1392,10 +1589,22 @@ function App() {
 				return;
 			}
 
+			if (!event.metaKey && !event.ctrlKey && !event.altKey) {
+				if (event.key === "ArrowLeft") {
+					event.preventDefault();
+					seekPlaybackBy(event.shiftKey ? -30 : -5);
+					return;
+				}
+				if (event.key === "ArrowRight") {
+					event.preventDefault();
+					seekPlaybackBy(event.shiftKey ? 30 : 5);
+					return;
+				}
+			}
+
 			const key = typeof event.key === "string" ? event.key.toLowerCase() : "";
 			const code = typeof event.code === "string" ? event.code : "";
 			if (
-				!IS_MAC_PLATFORM &&
 				(key === "f" || code === "KeyF") &&
 				!event.repeat &&
 				!event.metaKey &&
@@ -1729,6 +1938,23 @@ function App() {
 		setPlaybackBackVisible(true);
 	}, []);
 
+	const handleFrontendPlaybackState = useCallback((state) => {
+		updatePlaybackTrackState((current) => {
+			const next = {
+				...current,
+				positionSeconds: state.positionSeconds,
+				startSeconds: state.startSeconds,
+				endSeconds: state.endSeconds,
+				seekable: state.seekable,
+			};
+			return current.dragging ? { ...next, positionSeconds: current.positionSeconds } : next;
+		});
+	}, []);
+
+	const handleFrontendSeekReady = useCallback((seekTo) => {
+		playbackSeekRef.current = typeof seekTo === "function" ? seekTo : null;
+	}, []);
+
 	if (loading) {
 		return (
 			<main className="shell">
@@ -1748,12 +1974,12 @@ function App() {
 				controlsVisible={playbackBackVisible}
 				fullscreenActive={playbackFullscreen}
 				playbackTitle={playbackTitle}
-				playbackPositionSeconds={0}
-				playbackTrackStartSeconds={0}
-				playbackTrackEndSeconds={0}
-				playbackTrackMode="live"
-				playbackSeekable={false}
-				playbackTrackDragging={false}
+				playbackPositionSeconds={playbackTrack.positionSeconds}
+				playbackTrackStartSeconds={playbackTrack.startSeconds}
+				playbackTrackEndSeconds={playbackTrack.endSeconds}
+				playbackTrackMode={playbackTrack.seekable ? "live-cache" : "live"}
+				playbackSeekable={playbackTrack.seekable}
+				playbackTrackDragging={playbackTrack.dragging}
 				danmakuItems={danmakuItems}
 				danmakuFontSize={normalizeDanmakuFontSize(settings.danmakuFontSize)}
 				onBack={() => {
@@ -1765,16 +1991,18 @@ function App() {
 				onPointerMove={handlePlaybackPointerMove}
 				onPointerLeave={handlePlaybackPointerLeave}
 				onStageDoubleClick={handlePlaybackStageDoubleClick}
-				onTrackPointerDown={() => {}}
-				onTrackPointerMove={() => {}}
-				onTrackPointerUp={() => {}}
-				onTrackPointerCancel={() => {}}
+				onTrackPointerDown={handlePlaybackTrackPointerDown}
+				onTrackPointerMove={handlePlaybackTrackPointerMove}
+				onTrackPointerUp={handlePlaybackTrackPointerEnd}
+				onTrackPointerCancel={handlePlaybackTrackPointerEnd}
 			>
 				{frontendPlayback.playInfo ? (
 					<FrontendVideoPlayer
 						playInfo={frontendPlayback.playInfo}
 						onReady={handleFrontendPlayerReady}
 						onError={handleFrontendPlayerError}
+						onPlaybackState={handleFrontendPlaybackState}
+						onSeekReady={handleFrontendSeekReady}
 					/>
 				) : null}
 				{frontendPlayback.errorMessage ? (
