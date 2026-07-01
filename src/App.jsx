@@ -2184,13 +2184,6 @@ function App() {
 			) : (
 				<section className="page-section settings-page">
 					<div className="sub-panel">
-						<div className="sub-panel-head">
-							<h3>播放器设置</h3>
-						</div>
-						<div className="player-inline-note">
-							<strong>网页播放器</strong>
-							<span>使用 video + MSE 播放 HTTP-FLV/HLS。</span>
-						</div>
 						<div className="player-extra">
 							<label className="setting-stack" htmlFor="danmaku-font-size">
 								<div className="setting-label-row">
@@ -2206,26 +2199,21 @@ function App() {
 									max="28"
 									step="1"
 									value={normalizeDanmakuFontSize(settings.danmakuFontSize)}
-									onChange={(event) =>
+									onChange={(event) => {
+										const nextFontSize = normalizeDanmakuFontSize(
+											event.target.value,
+										);
 										setSettings((current) => ({
 											...current,
-											danmakuFontSize: normalizeDanmakuFontSize(
-												event.target.value,
-											),
-										}))
-									}
+											danmakuFontSize: nextFontSize,
+										}));
+										persistSettings(
+											{ ...settings, danmakuFontSize: nextFontSize },
+											"",
+										);
+									}}
 								/>
 							</label>
-							<div className="settings-actions">
-								<button
-									type="button"
-									className="ghost-button"
-									disabled={saving}
-									onClick={() => persistSettings(settings, "弹幕字号已保存")}
-								>
-									保存字号
-								</button>
-							</div>
 						</div>
 						<div className="player-extra">
 							<div className="login-status-row compact">
