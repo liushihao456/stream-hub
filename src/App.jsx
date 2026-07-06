@@ -24,6 +24,8 @@ const DANMAKU_ROW_GAP_PX = 96;
 const DANMAKU_MAX_FLUSH_PER_FRAME = 6;
 const DANMAKU_MAX_PENDING_TEXTS = 120;
 const DANMAKU_MAX_MESSAGE_AGE_MS = 2000;
+const PLAYBACK_VOLUME_STORAGE_KEY = "stream-hub:playback-volume";
+const PLAYBACK_MUTED_STORAGE_KEY = "stream-hub:playback-muted";
 const IS_MAC_PLATFORM =
 	typeof navigator !== "undefined" && /Mac/.test(navigator.platform);
 function parseDanmakuPayload(raw) {
@@ -51,6 +53,28 @@ function parseDanmakuPayload(raw) {
 			timestampMs: Date.now(),
 		};
 	}
+}
+
+function normalizePlaybackVolume(value) {
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed)) {
+		return 1;
+	}
+	return Math.min(1, Math.max(0, parsed));
+}
+
+function loadStoredPlaybackVolume() {
+	if (typeof window === "undefined") {
+		return 1;
+	}
+	return normalizePlaybackVolume(window.localStorage.getItem(PLAYBACK_VOLUME_STORAGE_KEY));
+}
+
+function loadStoredPlaybackMuted() {
+	if (typeof window === "undefined") {
+		return false;
+	}
+	return window.localStorage.getItem(PLAYBACK_MUTED_STORAGE_KEY) === "true";
 }
 
 function PlatformIcon({ platform, iconUrls }) {
@@ -121,6 +145,35 @@ function LeftChevronIcon() {
 				strokeLinecap="round"
 				strokeLinejoin="round"
 			/>
+		</svg>
+	);
+}
+
+function VolumeIcon({ muted, volume }) {
+	const silent = muted || volume <= 0;
+	return (
+		<svg viewBox="0 0 24 24" aria-hidden="true" className="playback-volume-icon">
+			<path
+				d="M4.5 9.5h3.2L12 5.8v12.4l-4.3-3.7H4.5z"
+				fill="none"
+				stroke="currentColor"
+				strokeWidth="1.8"
+				strokeLinecap="round"
+				strokeLinejoin="round"
+			/>
+			{silent ? (
+				<>
+					<path d="M16.5 9.5 20 13" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+					<path d="M20 9.5 16.5 13" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+				</>
+			) : volume < 0.5 ? (
+				<path d="M15.4 10.2a3 3 0 0 1 0 3.6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+			) : (
+				<>
+					<path d="M15.4 10.2a3 3 0 0 1 0 3.6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+					<path d="M18.1 7.6a6.6 6.6 0 0 1 0 8.8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+				</>
+			)}
 		</svg>
 	);
 }
@@ -464,6 +517,9 @@ function PlaybackPage({
 	playbackTrackDragging,
 	danmakuItems,
 	danmakuFontSize,
+	volume,
+	muted,
+	volumePopoverVisible,
 	onBack,
 	onToggleFullscreen,
 	onPointerMove,
@@ -473,6 +529,12 @@ function PlaybackPage({
 	onTrackPointerMove,
 	onTrackPointerUp,
 	onTrackPointerCancel,
+	onToggleMute,
+	onVolumePointerEnter,
+	onVolumePointerLeave,
+	onVolumePointerDown,
+	onVolumePointerMove,
+	onVolumePointerEnd,
 }) {
 	const trackStart = Number.isFinite(playbackTrackStartSeconds)
 		? playbackTrackStartSeconds
@@ -490,6 +552,9 @@ function PlaybackPage({
 			? `${((normalizedPosition - trackStart) / normalizedDuration) * 100}%`
 			: "100%";
 	const isLiveCacheTrack = playbackTrackMode === "live-cache";
+	const normalizedVolume = normalizePlaybackVolume(volume);
+	const volumePercent = Math.round(normalizedVolume * 100);
+	const effectivelyMuted = muted || normalizedVolume <= 0;
 
 	return (
 		<main
@@ -554,22 +619,65 @@ function PlaybackPage({
 						<p className="playback-track-title">
 							{playbackTitle || "正在播放"}
 						</p>
-						{isLiveCacheTrack ? (
-							<span className="playback-track-live-time">
-								<span className="playback-track-live-pill">LIVE</span>
+						<div className="playback-track-actions">
+							<div
+								className="playback-volume-control"
+								onPointerEnter={onVolumePointerEnter}
+								onPointerLeave={onVolumePointerLeave}
+							>
+								<button
+									type="button"
+									className="playback-volume-button"
+									onClick={onToggleMute}
+									aria-label={effectivelyMuted ? "取消静音" : "静音"}
+								>
+									<VolumeIcon muted={effectivelyMuted} volume={normalizedVolume} />
+								</button>
+								<div className={`playback-volume-popover ${volumePopoverVisible ? "visible" : ""}`.trim()}>
+									<div
+										className="playback-volume-slider"
+										role="slider"
+										tabIndex={0}
+										aria-label="音量"
+										aria-valuemin={0}
+										aria-valuemax={100}
+										aria-valuenow={volumePercent}
+										onPointerDown={onVolumePointerDown}
+										onPointerMove={onVolumePointerMove}
+										onPointerUp={onVolumePointerEnd}
+										onPointerCancel={onVolumePointerEnd}
+										onLostPointerCapture={onVolumePointerEnd}
+									>
+										<span className="playback-volume-slider-track" aria-hidden="true">
+											<span
+												className="playback-volume-slider-fill"
+												style={{ height: `${volumePercent}%` }}
+											/>
+											<span
+												className="playback-volume-slider-thumb"
+												style={{ bottom: `${volumePercent}%` }}
+											/>
+										</span>
+									</div>
+								</div>
+							</div>
+							{isLiveCacheTrack ? (
+								<span className="playback-track-live-time">
+									<span className="playback-track-live-pill">LIVE</span>
+									<span className="playback-track-time">
+										{formatPlaybackTime(normalizedPosition - trackStart)} /{" "}
+										{formatPlaybackTime(normalizedDuration)}
+									</span>
+								</span>
+							) : playbackSeekable ? (
 								<span className="playback-track-time">
 									{formatPlaybackTime(normalizedPosition - trackStart)} /{" "}
 									{formatPlaybackTime(normalizedDuration)}
 								</span>
-							</span>
-						) : playbackSeekable ? (
-							<span className="playback-track-time">
-								{formatPlaybackTime(normalizedPosition - trackStart)} /{" "}
-								{formatPlaybackTime(normalizedDuration)}
-							</span>
-						) : (
-							<span className="playback-track-live-pill">LIVE</span>
-						)}
+							) : (
+								<span className="playback-track-live-pill">LIVE</span>
+							)}
+						</div>
 					</div>
 					<div
 						className={`playback-track-rail ${playbackSeekable ? "seekable" : "live"} ${isLiveCacheTrack ? "live-cache" : ""} ${playbackTrackDragging ? "dragging" : ""}`.trim()}
@@ -617,9 +725,19 @@ function describePlaybackUrl(url) {
 	}
 }
 
-function FrontendVideoPlayer({ playInfo, onReady, onError, onPlaybackState, onSeekReady }) {
+function FrontendVideoPlayer({ playInfo, volume, muted, onReady, onError, onPlaybackState, onSeekReady }) {
 	const videoRef = useRef(null);
 	const readyFiredRef = useRef(false);
+
+	useEffect(() => {
+		const video = videoRef.current;
+		if (!video) {
+			return;
+		}
+		const normalizedVolume = normalizePlaybackVolume(volume);
+		video.volume = normalizedVolume;
+		video.muted = Boolean(muted) || normalizedVolume <= 0;
+	}, [volume, muted]);
 
 	useEffect(() => {
 		const video = videoRef.current;
@@ -876,6 +994,9 @@ function App() {
 	const [viewMode, setViewMode] = useState("browse");
 	const [playbackBackVisible, setPlaybackBackVisible] = useState(false);
 	const [playbackFullscreen, setPlaybackFullscreen] = useState(false);
+	const [playbackVolume, setPlaybackVolume] = useState(loadStoredPlaybackVolume);
+	const [playbackMuted, setPlaybackMuted] = useState(loadStoredPlaybackMuted);
+	const [playbackVolumePopoverVisible, setPlaybackVolumePopoverVisible] = useState(false);
 	const [currentPlaybackStreamer, setCurrentPlaybackStreamer] = useState(null);
 	const [frontendPlayback, setFrontendPlayback] = useState({ phase: "idle", playInfo: null, errorMessage: "" });
 	const [playbackTrack, setPlaybackTrack] = useState({
@@ -905,6 +1026,10 @@ function App() {
 	});
 	const playbackTrackDraggingRef = useRef(false);
 	const playbackFullscreenRef = useRef(false);
+	const playbackLastAudibleVolumeRef = useRef(playbackVolume > 0 ? playbackVolume : 1);
+	const playbackVolumeDraggingRef = useRef(false);
+	const playbackVolumeHoverHeldRef = useRef(false);
+	const playbackVolumePopoverTimerRef = useRef(0);
 	const playbackFullscreenCommandInFlightRef = useRef(false);
 	const playbackFullscreenToggleQueuedRef = useRef(false);
 	const playbackFocusTimersRef = useRef([]);
@@ -915,11 +1040,36 @@ function App() {
 	const danmakuFlushFrameRef = useRef(0);
 	const danmakuNextIdRef = useRef(1);
 
+	useEffect(() => {
+		try {
+			window.localStorage.setItem(PLAYBACK_VOLUME_STORAGE_KEY, String(playbackVolume));
+			window.localStorage.setItem(PLAYBACK_MUTED_STORAGE_KEY, String(playbackMuted));
+		} catch {
+			// Ignore storage errors.
+		}
+	}, [playbackVolume, playbackMuted]);
+
 	function clearPlaybackBackHideTimer() {
 		if (playbackBackHideTimerRef.current) {
 			window.clearTimeout(playbackBackHideTimerRef.current);
 			playbackBackHideTimerRef.current = 0;
 		}
+	}
+
+	function clearPlaybackVolumePopoverTimer() {
+		if (playbackVolumePopoverTimerRef.current) {
+			window.clearTimeout(playbackVolumePopoverTimerRef.current);
+			playbackVolumePopoverTimerRef.current = 0;
+		}
+	}
+
+	function showPlaybackVolumePopoverTemporarily() {
+		setPlaybackVolumePopoverVisible(true);
+		clearPlaybackVolumePopoverTimer();
+		playbackVolumePopoverTimerRef.current = window.setTimeout(() => {
+			setPlaybackVolumePopoverVisible(false);
+			playbackVolumePopoverTimerRef.current = 0;
+		}, 1200);
 	}
 
 	function schedulePlaybackBackHide() {
@@ -1001,6 +1151,81 @@ function App() {
 		playbackTrackDraggingRef.current = false;
 		event.currentTarget.releasePointerCapture?.(event.pointerId);
 		updatePlaybackTrackState((current) => ({ ...current, dragging: false }));
+		releasePlaybackControls();
+	}
+
+	function handlePlaybackVolumeChange(nextVolume) {
+		const normalizedVolume = normalizePlaybackVolume(nextVolume);
+		setPlaybackVolume(normalizedVolume);
+		if (normalizedVolume > 0) {
+			playbackLastAudibleVolumeRef.current = normalizedVolume;
+			setPlaybackMuted(false);
+		} else {
+			setPlaybackMuted(true);
+		}
+		revealPlaybackControls();
+	}
+
+	function togglePlaybackMuted() {
+		setPlaybackMuted((currentMuted) => {
+			const nextMuted = !currentMuted && playbackVolume > 0;
+			if (!nextMuted && playbackVolume <= 0) {
+				const restoredVolume = playbackLastAudibleVolumeRef.current || 1;
+				setPlaybackVolume(restoredVolume);
+			}
+			return nextMuted;
+		});
+		revealPlaybackControls();
+	}
+
+	function handlePlaybackVolumePointerEnter() {
+		if (playbackVolumeHoverHeldRef.current) {
+			return;
+		}
+		playbackVolumeHoverHeldRef.current = true;
+		holdPlaybackControls();
+	}
+
+	function handlePlaybackVolumePointerLeave() {
+		if (!playbackVolumeHoverHeldRef.current) {
+			return;
+		}
+		playbackVolumeHoverHeldRef.current = false;
+		releasePlaybackControls();
+	}
+
+	function setPlaybackVolumeFromPointerEvent(event) {
+		const rect = event.currentTarget.getBoundingClientRect();
+		const ratio = rect.height > 0
+			? 1 - (event.clientY - rect.top) / rect.height
+			: 0;
+		handlePlaybackVolumeChange(ratio);
+	}
+
+	function handlePlaybackVolumePointerDown(event) {
+		event.preventDefault();
+		event.currentTarget.focus?.({ preventScroll: true });
+		playbackVolumeDraggingRef.current = true;
+		event.currentTarget.setPointerCapture?.(event.pointerId);
+		holdPlaybackControls();
+		setPlaybackVolumeFromPointerEvent(event);
+	}
+
+	function handlePlaybackVolumePointerMove(event) {
+		if (!playbackVolumeDraggingRef.current) {
+			return;
+		}
+		event.preventDefault();
+		setPlaybackVolumeFromPointerEvent(event);
+	}
+
+	function handlePlaybackVolumePointerEnd(event) {
+		if (!playbackVolumeDraggingRef.current) {
+			return;
+		}
+		event.preventDefault();
+		playbackVolumeDraggingRef.current = false;
+		event.currentTarget.releasePointerCapture?.(event.pointerId);
 		releasePlaybackControls();
 	}
 
@@ -1286,8 +1511,11 @@ function App() {
 	function restoreBrowseView() {
 		playbackAwaitingStartRef.current = false;
 		clearPlaybackBackHideTimer();
+		clearPlaybackVolumePopoverTimer();
 		clearPlaybackFocusTimers();
 		playbackControlsHoldCountRef.current = 0;
+		playbackVolumeHoverHeldRef.current = false;
+		playbackVolumeDraggingRef.current = false;
 		playbackPointerPositionRef.current = { x: null, y: null };
 		playbackFullscreenToggleQueuedRef.current = false;
 		clearDanmakuState();
@@ -1295,6 +1523,7 @@ function App() {
 		setCurrentPlaybackStreamer(null);
 		setFrontendPlayback({ phase: "idle", playInfo: null, errorMessage: "" });
 		setPlaybackBackVisible(false);
+		setPlaybackVolumePopoverVisible(false);
 		playbackFullscreenRef.current = false;
 		setPlaybackFullscreen(false);
 		setViewMode("browse");
@@ -1365,6 +1594,8 @@ function App() {
 		restoreScrollRef.current = null;
 		clearPlaybackBackHideTimer();
 		playbackControlsHoldCountRef.current = 0;
+		playbackVolumeHoverHeldRef.current = false;
+		playbackVolumeDraggingRef.current = false;
 		playbackPointerPositionRef.current = { x: null, y: null };
 		playbackFullscreenToggleQueuedRef.current = false;
 		resetPlaybackTrack();
@@ -1603,6 +1834,10 @@ function App() {
 		}
 
 		function handleKeyDown(event) {
+			const target = event.target;
+			const isVolumeSliderFocused =
+				target instanceof Element && target.closest(".playback-volume-slider");
+
 			if (event.key === "Escape") {
 				event.preventDefault();
 				void handlePlaybackEscapeKey();
@@ -1610,12 +1845,24 @@ function App() {
 			}
 
 			if (!event.metaKey && !event.ctrlKey && !event.altKey) {
-				if (event.key === "ArrowLeft") {
+				if (event.key === "ArrowUp") {
+					event.preventDefault();
+					handlePlaybackVolumeChange(playbackVolume + 0.1);
+					showPlaybackVolumePopoverTemporarily();
+					return;
+				}
+				if (event.key === "ArrowDown") {
+					event.preventDefault();
+					handlePlaybackVolumeChange(playbackVolume - 0.1);
+					showPlaybackVolumePopoverTemporarily();
+					return;
+				}
+				if (!isVolumeSliderFocused && event.key === "ArrowLeft") {
 					event.preventDefault();
 					seekPlaybackBy(event.shiftKey ? -30 : -5);
 					return;
 				}
-				if (event.key === "ArrowRight") {
+				if (!isVolumeSliderFocused && event.key === "ArrowRight") {
 					event.preventDefault();
 					seekPlaybackBy(event.shiftKey ? 30 : 5);
 					return;
@@ -1642,7 +1889,7 @@ function App() {
 		return () => {
 			document.removeEventListener("keydown", handleKeyDown, true);
 		};
-	}, [viewMode]);
+	}, [viewMode, playbackVolume]);
 
 	useEffect(() => {
 		const target = currentPlaybackStreamer?.target?.trim();
@@ -2002,6 +2249,9 @@ function App() {
 				playbackTrackDragging={playbackTrack.dragging}
 				danmakuItems={danmakuItems}
 				danmakuFontSize={normalizeDanmakuFontSize(settings.danmakuFontSize)}
+				volume={playbackVolume}
+				muted={playbackMuted}
+				volumePopoverVisible={playbackVolumePopoverVisible}
 				onBack={() => {
 					void exitPlaybackView();
 				}}
@@ -2015,10 +2265,18 @@ function App() {
 				onTrackPointerMove={handlePlaybackTrackPointerMove}
 				onTrackPointerUp={handlePlaybackTrackPointerEnd}
 				onTrackPointerCancel={handlePlaybackTrackPointerEnd}
+				onToggleMute={togglePlaybackMuted}
+				onVolumePointerEnter={handlePlaybackVolumePointerEnter}
+				onVolumePointerLeave={handlePlaybackVolumePointerLeave}
+				onVolumePointerDown={handlePlaybackVolumePointerDown}
+				onVolumePointerMove={handlePlaybackVolumePointerMove}
+				onVolumePointerEnd={handlePlaybackVolumePointerEnd}
 			>
 				{frontendPlayback.playInfo ? (
 					<FrontendVideoPlayer
 						playInfo={frontendPlayback.playInfo}
+						volume={playbackVolume}
+						muted={playbackMuted}
 						onReady={handleFrontendPlayerReady}
 						onError={handleFrontendPlayerError}
 						onPlaybackState={handleFrontendPlaybackState}
