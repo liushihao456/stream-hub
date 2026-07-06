@@ -201,6 +201,7 @@ struct DanmakuCommentPayload {
 struct DanmakuEventPayload {
     method: String,
     kind: String,
+    timestamp_ms: u64,
     dms: Vec<DanmakuCommentPayload>,
 }
 
@@ -707,10 +708,18 @@ fn extract_douyin_room_id(target: &str) -> Option<String> {
     None
 }
 
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 fn danmaku_text_event(kind: &str, text: impl Into<String>) -> Result<String, String> {
     let event = DanmakuEventPayload {
         method: "sendDM".to_string(),
         kind: kind.to_string(),
+        timestamp_ms: current_timestamp_ms(),
         dms: vec![DanmakuCommentPayload { text: text.into() }],
     };
     serde_json::to_string(&event).map_err(|err| err.to_string())

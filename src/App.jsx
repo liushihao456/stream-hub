@@ -23,6 +23,7 @@ const DANMAKU_EXIT_PADDING_PX = 64;
 const DANMAKU_ROW_GAP_PX = 96;
 const DANMAKU_MAX_FLUSH_PER_FRAME = 6;
 const DANMAKU_MAX_PENDING_TEXTS = 120;
+const DANMAKU_MAX_MESSAGE_AGE_MS = 2000;
 const IS_MAC_PLATFORM =
 	typeof navigator !== "undefined" && /Mac/.test(navigator.platform);
 function parseDanmakuPayload(raw) {
@@ -36,12 +37,18 @@ function parseDanmakuPayload(raw) {
 					)
 					.filter(Boolean)
 			: [];
-		return { kind, texts };
+		const timestampMs = Number(payload?.timestampMs);
+		return {
+			kind,
+			texts,
+			timestampMs: Number.isFinite(timestampMs) ? timestampMs : Date.now(),
+		};
 	} catch {
 		const text = String(raw).trim();
 		return {
 			kind: "chat",
 			texts: text ? [text] : [],
+			timestampMs: Date.now(),
 		};
 	}
 }
@@ -1153,12 +1160,16 @@ function App() {
 
 		danmakuFlushFrameRef.current = window.requestAnimationFrame(() => {
 			danmakuFlushFrameRef.current = 0;
+			const cutoffTimestampMs = Date.now() - DANMAKU_MAX_MESSAGE_AGE_MS;
+			danmakuPendingTextsRef.current = danmakuPendingTextsRef.current.filter(
+				(item) => item.timestampMs >= cutoffTimestampMs,
+			);
 			const pending = danmakuPendingTextsRef.current.splice(
 				0,
 				DANMAKU_MAX_FLUSH_PER_FRAME,
 			);
-			for (const text of pending) {
-				enqueueDanmaku(text);
+			for (const item of pending) {
+				enqueueDanmaku(item);
 			}
 			if (danmakuPendingTextsRef.current.length > 0) {
 				scheduleDanmakuFlush();
@@ -1166,8 +1177,14 @@ function App() {
 		});
 	}
 
-	function queueDanmakuText(text) {
-		danmakuPendingTextsRef.current.push(text);
+	function queueDanmakuText(text, timestampMs = Date.now()) {
+		const normalizedTimestampMs = Number(timestampMs);
+		danmakuPendingTextsRef.current.push({
+			text,
+			timestampMs: Number.isFinite(normalizedTimestampMs)
+				? normalizedTimestampMs
+				: Date.now(),
+		});
 		if (danmakuPendingTextsRef.current.length > DANMAKU_MAX_PENDING_TEXTS) {
 			danmakuPendingTextsRef.current.splice(
 				0,
@@ -1177,8 +1194,11 @@ function App() {
 		scheduleDanmakuFlush();
 	}
 
-	function enqueueDanmaku(text) {
-		const content = text.trim();
+	function enqueueDanmaku(message) {
+		if (Date.now() - message.timestampMs > DANMAKU_MAX_MESSAGE_AGE_MS) {
+			return;
+		}
+		const content = message.text.trim();
 		if (!content) {
 			return;
 		}
@@ -1665,7 +1685,7 @@ function App() {
 					if (cancelled || typeof event.data !== "string") {
 						return;
 					}
-					const { kind, texts } = parseDanmakuPayload(event.data);
+					const { kind, texts, timestampMs } = parseDanmakuPayload(event.data);
 					for (const text of texts) {
 						if (kind === "error") {
 							setError(text);
@@ -1674,7 +1694,7 @@ function App() {
 						if (kind !== "chat") {
 							continue;
 						}
-						queueDanmakuText(text);
+						queueDanmakuText(text, timestampMs);
 					}
 				});
 
