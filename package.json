@@ -17,8 +17,8 @@
   "type": "commonjs",
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
+    "flv.js": "^1.6.2",
     "hls.js": "^1.6.16",
-    "mpegts.js": "^1.8.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"
   },

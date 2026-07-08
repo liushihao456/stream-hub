@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import Hls from "hls.js";
-import mpegts from "mpegts.js";
+import flvjs from "flv.js";
 
 const tabs = [
 	{ id: "favorites", label: "收藏" },
@@ -919,18 +919,18 @@ function FrontendVideoPlayer({ playInfo, volume, muted, onReady, onError, onPlay
 			} else {
 				fireError("当前 WebView 不支持 HLS/MSE 播放");
 			}
-		} else if (mpegts.getFeatureList?.()?.mseLivePlayback || mpegts.isSupported()) {
-			console.info("[stream-hub:player] using mpegts.js", mpegts.getFeatureList?.());
-			player = mpegts.createPlayer({ type: "flv", isLive: true, url });
-			player.on(mpegts.Events.ERROR, (typeName, detail, info) => {
-				console.error("[stream-hub:player] mpegts error", { typeName, detail, info });
+		} else if (flvjs.getFeatureList?.()?.mseLiveFlvPlayback || flvjs.isSupported()) {
+			console.info("[stream-hub:player] using flv.js", flvjs.getFeatureList?.());
+			player = flvjs.createPlayer({ type: "flv", isLive: true, url });
+			player.on(flvjs.Events.ERROR, (typeName, detail, info) => {
+				console.error("[stream-hub:player] flv.js error", { typeName, detail, info });
 				if (!disposed) {
 					fireError(`FLV 播放失败：${typeName || "未知错误"} ${detail || ""}`.trim());
 				}
 			});
 			player.attachMediaElement(video);
 			player.load();
-			handlePlayPromise(player.play?.());
+			handlePlayPromise(video.play());
 		} else {
 			fireError("当前 WebView 不支持 MSE，无法使用网页 FLV 播放器");
 		}
